@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>UnifiedCacheLinker 调用与状态流</title>
+  <style>
+    :root{--bg:#08111f;--panel:#101d2f;--panel2:#13243a;--line:#34506f;--text:#e9f1fb;--muted:#9db0c8;--cyan:#38d7e7;--blue:#6ea8ff;--green:#58d68d;--amber:#f7c65c;--red:#ff7b7b;--violet:#b69cff}
+    *{box-sizing:border-box} body{margin:0;background:radial-gradient(circle at 20% 0,#132943 0,var(--bg) 36%);color:var(--text);font:14px/1.55 Inter,"Microsoft YaHei",system-ui,sans-serif}
+    .wrap{max-width:1500px;margin:auto;padding:34px 28px 64px}.hero{display:flex;justify-content:space-between;gap:24px;align-items:flex-end;margin-bottom:24px}.eyebrow{color:var(--cyan);letter-spacing:.16em;font-weight:700;font-size:12px}.hero h1{font-size:36px;margin:7px 0 5px}.hero p{margin:0;color:var(--muted);max-width:880px}.badge{border:1px solid #3a587a;background:#10233a;border-radius:99px;padding:8px 14px;color:#c9d7e8;white-space:nowrap}
+    .notice{border-left:4px solid var(--amber);background:#2a2415;padding:13px 16px;border-radius:8px;margin:18px 0 25px}.notice b{color:var(--amber)}
+    .tabs{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 18px}.tab{cursor:pointer;border:1px solid var(--line);background:#0c192a;color:#b9c8da;border-radius:9px;padding:9px 15px;font-weight:650}.tab.active{color:#07131e;background:var(--cyan);border-color:var(--cyan)}.view{display:none}.view.active{display:block}
+    .card{background:linear-gradient(145deg,var(--panel),#0c1829);border:1px solid #28425e;border-radius:14px;padding:20px;box-shadow:0 16px 36px #02060d55}.card h2{font-size:20px;margin:0 0 5px}.sub{color:var(--muted);margin:0 0 18px}.grid{display:grid;gap:14px}.g3{grid-template-columns:repeat(3,1fr)}.g4{grid-template-columns:repeat(4,1fr)}
+    .box{position:relative;background:var(--panel2);border:1px solid #365572;border-radius:12px;padding:15px;min-height:104px}.box h3{font-size:15px;margin:0 0 7px;color:#fff}.box p{margin:0;color:var(--muted)}.box code,.pill,code{font-family:"Cascadia Code",Consolas,monospace}.accent-c{border-top:3px solid var(--cyan)}.accent-b{border-top:3px solid var(--blue)}.accent-g{border-top:3px solid var(--green)}.accent-a{border-top:3px solid var(--amber)}
+    .arrow{height:34px;position:relative}.arrow:before{content:"";position:absolute;left:50%;top:4px;height:24px;border-left:2px solid #527493}.arrow:after{content:"";position:absolute;left:calc(50% - 5px);top:21px;width:9px;height:9px;border-right:2px solid #527493;border-bottom:2px solid #527493;transform:rotate(45deg)}
+    .lane{display:grid;grid-template-columns:170px 1fr;border-top:1px solid #263e58}.lane:first-child{border-top:0}.actor{padding:14px;color:#9fc4eb;font-weight:700;border-right:1px solid #263e58}.steps{padding:9px 12px}.step{display:flex;gap:12px;align-items:flex-start;margin:8px 0;padding:10px 12px;background:#12233a;border-radius:9px;border-left:3px solid var(--blue)}.step.lookup{border-color:var(--cyan)}.step.load{border-color:var(--green)}.step.offload{border-color:var(--amber)}.num{display:grid;place-items:center;min-width:24px;height:24px;border-radius:50%;background:#274564;font-weight:700}.step strong{display:block}.step small{color:var(--muted)}
+    table{width:100%;border-collapse:collapse;font-size:13px}th{text-align:left;color:#9ec2e7;background:#142842}th,td{border:1px solid #294560;padding:10px;vertical-align:top}td code{color:#bdeff5}.ret{color:var(--green)}
+    .flow{display:flex;align-items:stretch;gap:28px;overflow-x:auto;padding:6px 2px 16px}.node{min-width:205px;max-width:250px;background:#12233a;border:1px solid #345370;border-radius:12px;padding:14px;position:relative}.node:not(:last-child):after{content:"➜";position:absolute;right:-23px;top:42%;color:#6f91b1;font-size:19px}.node b{display:block;margin-bottom:5px}.node span{color:var(--muted);font-size:12px}.node.backend{border-color:#8e79cc}.node.tree{border-color:#55a8bc}.node.ok{border-color:#4f9e72}
+    .split{display:grid;grid-template-columns:1fr 1fr;gap:16px}.legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);margin:12px 0}.dot:before{content:"";display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:var(--blue)}.dot.g:before{background:var(--green)}.dot.a:before{background:var(--amber)}
+    .state{display:grid;grid-template-columns:repeat(3,1fr);gap:28px;align-items:center}.state .node{max-width:none;min-width:0}.state .node:not(:last-child):after{right:-24px}.footer{color:#7890aa;margin-top:22px;font-size:12px;text-align:right}
+    @media(max-width:900px){.g3,.g4,.split,.state{grid-template-columns:1fr}.hero{display:block}.badge{display:inline-block;margin-top:14px}.node:not(:last-child):after,.state .node:not(:last-child):after{display:none}.flow{display:grid}.lane{grid-template-columns:1fr}.actor{border-right:0;border-bottom:1px solid #263e58}}
+  </style>
+</head>
+<body><main class="wrap">
+  <header class="hero"><div><div class="eyebrow">SGLANG · DIRECT L3 CONTRACT</div><h1>UnifiedCacheLinker 调用与状态流</h1><p>只描述抽象接口、UnifiedCacheLinkerWrapper、UnifiedRadixCache 与 TreeComponent 的协作。Backend 实现是黑盒；Mooncake 的线程、session、range I/O 将在另一张图中展开。</p></div><div class="badge">源码基线 · 2026-09-22</div></header>
+  <div class="notice"><b>关键边界：</b> Wrapper 决定“查什么、插入什么、锁哪个 node、何时发布状态”；Backend 决定“数据如何存在 L3、如何搬运、何时完成”。<code>load()</code> 只入队，实际执行由 <code>start_layer_wise_loading()</code> 触发。</div>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="overview">总体结构</button><button class="tab" data-tab="api">接口参数</button><button class="tab" data-tab="lookup">Lookup / Match</button><button class="tab" data-tab="load">Load / Layerwise</button><button class="tab" data-tab="offload">Dump / Offload</button><button class="tab" data-tab="state">状态与完成</button>
+  </nav>
+
+  <section id="overview" class="view active card"><h2>1. 分层职责</h2><p class="sub">调用方向自上而下；完成通知再由 Backend 队列回到 Wrapper 和 Tree。</p>
+    <div class="grid g4">
+      <div class="box accent-b"><h3>Scheduler / Forward</h3><p><code>match_prefix</code><br><code>init_load_back</code><br><code>start_layer_wise_loading</code><br>逐层等待 counter</p></div>
+      <div class="box accent-c"><h3>UnifiedRadixCache</h3><p>调用 Wrapper；处理 Tree action；周期性消费 load/offload 完成结果。</p></div>
+      <div class="box accent-g"><h3>UnifiedCacheLinkerWrapper</h3><p>hash、TP 交集、component transfer、node insert/lock、pending 状态。</p></div>
+      <div class="box accent-a"><h3>UnifiedCacheLinker</h3><p>Backend 契约：lookup、queue load、启动逐层 load、queue offload、完成队列。</p></div>
+    </div><div class="arrow"></div>
+    <div class="grid g3">
+      <div class="box"><h3>TreeComponent</h3><p><code>build_external_linker_transfer(phase,node,keys)</code><br><code>update_external_linker_load(...)</code></p></div>
+      <div class="box"><h3>PoolTransfer</h3><p><code>name</code> · <code>keys</code> · <code>device_indices</code> · <code>hit_policy</code><br>逻辑页与物理设备位置的传输描述。</p></div>
+      <div class="box"><h3>External Backend（黑盒）</h3><p>实现 L3 key 查询、Device↔L3 I/O、layer completion 和最终成功结果。</p></div>
+    </div>
+  </section>
+
+  <section id="api" class="view card"><h2>2. UnifiedCacheLinker 接口参数</h2><p class="sub">接口定义在 <code>unified_cache_linker.py</code>；“调用方”主要是 Wrapper。</p>
+    <table><thead><tr><th>接口</th><th>参数</th><th>返回值</th><th>语义 / 约束</th></tr></thead><tbody>
+      <tr><td><code>lookup</code></td><td><code>rid: str</code><br><code>transfers: list[PoolTransfer]</code></td><td class="ret"><code>list[int]</code></td><td>返回本 rank 所有“完整可恢复”的前缀页数；集合允许稀疏。Wrapper 再对 TP/CP ranks 取交集。</td></tr>
+      <tr><td><code>load</code></td><td><code>rid: str</code><br><code>transfers</code></td><td class="ret"><code>bool</code></td><td>仅将 L3→Device 请求入队。<code>True</code> 不表示数据已写入 device。</td></tr>
+      <tr><td><code>start_layer_wise_loading</code></td><td>无</td><td class="ret"><code>int</code></td><td>启动此前排队的 load batch，返回 layer counter consumer index；无任务通常返回 -1。</td></tr>
+      <tr><td><code>cancel_queued_load</code></td><td><code>rid: str</code></td><td class="ret"><code>bool</code></td><td>只承诺取消“尚未启动”的 load；Tree 已发布后的安全回滚不属于该简单接口。</td></tr>
+      <tr><td><code>num_completed_loads</code></td><td>无</td><td class="ret"><code>int</code></td><td>已完成、等待 Wrapper 消费的 load batch 数。</td></tr>
+      <tr><td><code>pop_completed_load</code></td><td>无</td><td class="ret"><code>list[str]</code></td><td>弹出最老完成 batch 的 rid 列表，用来释放对应 node lock。</td></tr>
+      <tr><td><code>offload</code></td><td><code>transfers</code></td><td class="ret"><code>bool</code></td><td>将同一 node 的多 Pool 数据作为一次持久化任务入队；返回值只表示是否接受任务。</td></tr>
+      <tr><td><code>num_completed_offloads</code></td><td>无</td><td class="ret"><code>int</code></td><td>等待消费的 offload 最终结果数。</td></tr>
+      <tr><td><code>pop_completed_offload</code></td><td>无</td><td class="ret"><code>bool</code></td><td>按提交顺序弹出最终成功/失败；Wrapper 据此发布 node 的 stored 状态。</td></tr>
+      <tr><td><code>reset / close</code></td><td>无</td><td class="ret"><code>None</code></td><td>静默传输并清理 backend；Wrapper 同时释放本地 pending locks/state。</td></tr>
+      <tr><td><code>layer_done_counter</code></td><td>属性</td><td class="ret">counter 对象</td><td>KV pool/forward 用其等待对应 logical layer 的 L3→Device 搬运完成。</td></tr>
+    </tbody></table>
+  </section>
+
+  <section id="lookup" class="view card"><h2>3. Lookup / Match：只查询，不分配 Device slot</h2><p class="sub">输出是可恢复长度与 hit marker；Tree 还没有插入 L3 tail。</p>
+    <div class="flow">
+      <div class="node tree"><b>① Radix L1 match</b><span>得到 <code>result.device_indices</code>、<code>last_device_node</code> 和 device hit 长度。</span></div>
+      <div class="node"><b>② Wrapper._tail_hashes</b><span>以最后一个 L1 hash 为 anchor，对未命中且 page 对齐的 tail 生成 storage hashes。</span></div>
+      <div class="node"><b>③ TreeComponent</b><span>每个 component 构造 LOOKUP <code>PoolTransfer</code>；任一必要 transfer 缺失则放弃 L3 hit。</span></div>
+      <div class="node backend"><b>④ backend.lookup</b><span><code>lookup(rid, transfers)</code> 返回本 rank 稀疏的 restorable page set。</span></div>
+      <div class="node ok"><b>⑤ 跨 rank 交集</b><span>0/1 mask + MIN all-reduce，选择所有 rank 共同支持的最长边界。</span></div>
+      <div class="node tree"><b>⑥ 发布 MatchResult</b><span>保存 <code>hit_markers[rid]</code>，设置 host/swa/mamba hit length；不执行 I/O。</span></div>
+    </div>
+    <div class="split"><div class="box"><h3>ExternalCacheHitMarker</h3><p><code>prefix_key</code>：L1 prefix + 可恢复 tail<br><code>tail_hashes</code>：仅 tail 的 page hashes<br><code>device_hit_len</code>：已有 L1 token 数</p></div><div class="box"><h3>重要结果</h3><p><code>lookup()</code> 的返回不是“KV 最大命中数”，而是所有必要 Pool 在精确边界上均可恢复的页数集合。</p></div></div>
+  </section>
+
+  <section id="load" class="view card"><h2>4. Load：先建 Tree/分配 slot，再启动逐层 I/O</h2><p class="sub">绿色为 Wrapper/Tree 的准备与提交，紫色为 Backend 契约调用。</p>
+    <div class="lane"><div class="actor">Scheduler</div><div class="steps"><div class="step load"><span class="num">1</span><div><strong><code>UnifiedRadixCache.init_load_back(params)</code></strong><small>命中 marker 后调用 <code>Wrapper.load_back(req)</code>。</small></div></div></div></div>
+    <div class="lane"><div class="actor">Wrapper + Components</div><div class="steps">
+      <div class="step load"><span class="num">2</span><div><strong>构造 LOAD transfers</strong><small><code>build_external_linker_transfer(LOAD, None, tail_hashes)</code>，然后 <code>update_external_linker_load(PREPARE,...)</code> 分配/准备 device slots。</small></div></div>
+      <div class="step load"><span class="num">3</span><div><strong>先插入 Unified Tree</strong><small><code>cache.insert(..., track_adopted_ranges=True)</code>；对并发去重后的 adopted ranges 重新裁剪 indices 与 keys。</small></div></div>
+      <div class="step load"><span class="num">4</span><div><strong>COMMIT component 状态</strong><small><code>update_external_linker_load(COMMIT,...)</code> 生成最终 transfers；锁住 endpoint node，防止 DMA 期间 slot 被回收。</small></div></div>
+    </div></div>
+    <div class="lane"><div class="actor">Backend 黑盒</div><div class="steps">
+      <div class="step" style="border-color:var(--violet)"><span class="num">5</span><div><strong><code>load(rid, transfers) → queued</code></strong><small>这里只排队。Wrapper 保存 <code>pending_loads[rid]=(node_id, lock_params)</code>。</small></div></div>
+      <div class="step" style="border-color:var(--violet)"><span class="num">6</span><div><strong><code>start_layer_wise_loading() → counter_index</code></strong><small>在 batch dispatch/forward 前统一启动已排队任务。</small></div></div>
+    </div></div>
+    <div class="lane"><div class="actor">KV Pool / Forward</div><div class="steps"><div class="step load"><span class="num">7</span><div><strong>逐层等待</strong><small>计算 logical layer N 前，通过 <code>layer_done_counter</code> 等待 backend 标记该层完成；因此 load I/O 可与逐层 forward 流水重叠。</small></div></div></div></div>
+    <div class="lane"><div class="actor">完成回收</div><div class="steps"><div class="step load"><span class="num">8</span><div><strong>完成队列 → 释放 node lock</strong><small><code>num_completed_loads()</code> → <code>pop_completed_load()</code> → <code>Wrapper.drain_loads()</code>。注意 layer counter 管“可计算到哪层”，completed queue 管“整批可释放”。</small></div></div></div></div>
+  </section>
+
+  <section id="offload" class="view card"><h2>5. Dump / Offload：Tree action 驱动的异步写穿</h2><p class="sub">抽象接口称为 offload；是否逐层 dump、对象布局和协议由具体 backend 决定，Linker 契约本身没有逐层 offload counter。</p>
+    <div class="flow">
+      <div class="node tree"><b>① BackupKV action</b><span>Tree write-through chain 产生待持久化 <code>node_ids</code>。</span></div>
+      <div class="node"><b>② 构造 transfers</b><span><code>build_external_linker_offload_transfers(node_id)</code>；已 stored/pending 的 node 被跳过。</span></div>
+      <div class="node tree"><b>③ 加 node lock</b><span>保证 dump 读取期间 device slot 不被 allocator 回收或复用。</span></div>
+      <div class="node backend"><b>④ backend.offload</b><span><code>offload(transfers) → bool</code>；True 只表示成功入队。</span></div>
+      <div class="node"><b>⑤ 标记 pending</b><span><code>write_through_pending_id=node_id</code>，记录 FIFO <code>pending_offloads</code>。</span></div>
+      <div class="node ok"><b>⑥ 最终完成</b><span><code>pop_completed_offload()</code> 后调用 <code>finish_external_linker_offload(..., success)</code> 并释放 lock。</span></div>
+    </div>
+    <div class="notice"><b>不要混淆：</b><code>offload() == True</code> 是“任务已接受”；只有 <code>pop_completed_offload() == True</code> 才能令 <code>external_cache_stored=True</code>。Node split 时，Wrapper 会把 ack 的发布目标替换成 split 后的新 node IDs。</div>
+  </section>
+
+  <section id="state" class="view card"><h2>6. Node 状态与双完成信号</h2><p class="sub">Load 与 Offload 都锁 node，但发布的状态不同。</p>
+    <h3>Offload 状态机</h3><div class="state">
+      <div class="node"><b>L1 only</b><span><code>stored=False</code><br><code>pending=None</code></span></div>
+      <div class="node"><b>Offload pending</b><span><code>stored=False</code><br><code>pending=ack_id</code><br>node locked</span></div>
+      <div class="node ok"><b>L3 confirmed / failed</b><span>成功：<code>stored=True</code><br>失败：<code>stored=False</code><br>两者均清 pending、释放 lock</span></div>
+    </div>
+    <h3 style="margin-top:28px">Load 的两个“完成”</h3><div class="split">
+      <div class="box accent-g"><h3>逐层完成：layer_done_counter</h3><p>Backend 每完成一层 L3→Device，就推进 counter/event；Forward 只需等待当前层，支持 I/O 与计算流水。</p></div>
+      <div class="box accent-b"><h3>整批完成：completed_loads</h3><p>所有请求/层传输结束后，Backend 把 rid batch 放入完成队列；Wrapper 消费后释放 endpoint node locks。</p></div>
+    </div>
+    <div class="legend"><span class="dot">调度/控制</span><span class="dot g">Device 数据可用</span><span class="dot a">持久化结果</span></div>
+  </section>
+  <div class="footer">Generated from: unified_cache_linker.py · unified_radix_cache.py · scheduler call sites</div>
+</main>
+<script>
+  document.querySelectorAll('.tab').forEach(btn=>btn.addEventListener('click',()=>{
+    document.querySelectorAll('.tab,.view').forEach(x=>x.classList.remove('active'));
+    btn.classList.add('active'); document.getElementById(btn.dataset.tab).classList.add('active');
+  }));
+</script></body></html>
