@@ -26,7 +26,7 @@
   <div class="notice"><b>关键边界：</b> Wrapper 决定“查什么、插入什么、锁哪个 node、何时发布状态”；Backend 决定“数据如何存在 L3、如何搬运、何时完成”。<code>load()</code> 只入队，实际执行由 <code>start_layer_wise_loading()</code> 触发。</div>
 
   <nav class="tabs">
-    <button class="tab active" data-tab="overview">总体结构</button><button class="tab" data-tab="api">接口参数</button><button class="tab" data-tab="lookup">Lookup / Match</button><button class="tab" data-tab="load">Load / Layerwise</button><button class="tab" data-tab="offload">Dump / Offload</button><button class="tab" data-tab="state">状态与完成</button>
+    <button class="tab active" data-tab="overview">总体结构</button><button class="tab" data-tab="contract">Wrapper ↔ Linker</button><button class="tab" data-tab="api">Backend 接口参数</button><button class="tab" data-tab="lookup">Lookup / Match</button><button class="tab" data-tab="load">Load / Layerwise</button><button class="tab" data-tab="offload">Dump / Offload</button><button class="tab" data-tab="state">状态与完成</button>
   </nav>
 
   <section id="overview" class="view active card"><h2>1. 分层职责</h2><p class="sub">调用方向自上而下；完成通知再由 Backend 队列回到 Wrapper 和 Tree。</p>
@@ -43,7 +43,47 @@
     </div>
   </section>
 
-  <section id="api" class="view card"><h2>2. UnifiedCacheLinker 接口参数</h2><p class="sub">接口定义在 <code>unified_cache_linker.py</code>；“调用方”主要是 Wrapper。</p>
+  <section id="contract" class="view card"><h2>2. Wrapper 与 Linker 的接口边界</h2><p class="sub"><code>UnifiedCacheLinkerWrapper</code> 是 SGLang 已实现的 Tree 侧编排器；外部 Backend 只需要实现 <code>UnifiedCacheLinker</code> 抽象接口，不应重新实现 Wrapper。</p>
+    <div class="split">
+      <div class="box accent-g"><h3>UnifiedCacheLinkerWrapper（SGLang 提供）</h3><p>持有 <code>cache</code> 与 <code>cache_linker</code>；理解 Radix Tree、TreeComponent、node lock、TP/CP 同步和 pending 状态；把 Tree 操作翻译成 Backend 调用。</p></div>
+      <div class="box accent-a"><h3>UnifiedCacheLinker（Backend 实现）</h3><p>不接触 TreeNode；只理解 <code>PoolTransfer</code>、rid、物理 key/指针、异步 I/O、layer completion 与完成结果。Mooncake、UMBP、UCM 都实现这一侧。</p></div>
+    </div>
+    <h3 style="margin-top:22px">Wrapper 已实现的入口和辅助函数</h3>
+    <table><thead><tr><th>Wrapper 函数</th><th>调用来源</th><th>职责</th><th>是否调用 Backend</th></tr></thead><tbody>
+      <tr><td><code>match(key, req, result)</code></td><td><code>UnifiedRadixCache.match_prefix</code></td><td>生成 tail hashes 和 LOOKUP transfers；跨 rank 求共同恢复边界；保存 hit marker。</td><td><code>linker.lookup(...)</code></td></tr>
+      <tr><td><code>has_hit(rid)</code></td><td>Cache/Scheduler</td><td>判断本请求是否保存了 L3 hit marker。</td><td>否</td></tr>
+      <tr><td><code>load_back(req)</code></td><td><code>init_load_back</code></td><td>生成 LOAD transfers，PREPARE、Tree insert、adopted-range 裁剪、COMMIT、加 node lock。</td><td>经 <code>_queue_load()</code> 调用 <code>linker.load(...)</code></td></tr>
+      <tr><td><code>start_layer_wise_loading()</code></td><td>Batch dispatch/forward 前</td><td>启动当前已排队的 load batch，并取得 layer counter index。</td><td>直接转发到 Backend</td></tr>
+      <tr><td><code>offload_nodes(node_ids)</code></td><td>Tree 的 <code>BackupKV</code> action</td><td>逐 node 构造 OFFLOAD transfers；跳过已 stored/pending 的 node。</td><td>每个 node 经 <code>_offload_node()</code> 调用一次 <code>linker.offload(...)</code></td></tr>
+      <tr><td><code>num_completed_loads()</code></td><td>Cache 完成轮询</td><td>查询可消费的 load batch 数。</td><td>转发</td></tr>
+      <tr><td><code>drain_loads(count)</code></td><td>Cache 完成轮询</td><td>消费完成 rid，移除 <code>pending_loads</code> 并释放 endpoint node lock。</td><td>调用 <code>pop_completed_load()</code></td></tr>
+      <tr><td><code>num_completed_offloads()</code></td><td>Cache 完成轮询</td><td>查询最终 offload 结果数，并限制不超过本地 pending 数。</td><td>转发</td></tr>
+      <tr><td><code>take_completed_offloads(count)</code></td><td>Cache 完成轮询</td><td>先取得 Backend 的 FIFO bool 结果。</td><td>调用 <code>pop_completed_offload()</code></td></tr>
+      <tr><td><code>commit_completed_offloads(successes)</code></td><td>跨 rank 同步结果后</td><td>发布 stored/pending 状态并释放原 node lock。</td><td>否；只更新 Tree</td></tr>
+      <tr><td><code>replace_pending_offload_node(...)</code></td><td>offload 期间 node split</td><td>把 ack 的发布目标从旧 node 替换成 split 后的新 node IDs。</td><td>否</td></tr>
+      <tr><td><code>release_request(rid)</code></td><td>请求释放/取消</td><td>清 hit marker；仅在 Backend 确认取消成功时释放 pending load lock。</td><td><code>cancel_queued_load(rid)</code></td></tr>
+      <tr><td><code>reset()</code> / <code>close()</code></td><td>Cache 生命周期</td><td>先让 Backend 静默，再清 marker、失败发布 pending offload 并释放所有 lock。</td><td><code>linker.reset()/close()</code></td></tr>
+      <tr><td><code>layer_done_counter</code></td><td>KV Pool / Forward</td><td>暴露 Backend 的逐层完成计数器。</td><td>读取 <code>linker.layer_done_counter</code></td></tr>
+    </tbody></table>
+    <h3 style="margin-top:22px">Wrapper 内部辅助函数</h3>
+    <div class="grid g3">
+      <div class="box"><h3>查询辅助</h3><p><code>_tail_hashes()</code><br><code>_sync_restorable_prefix()</code><br>生成 page key，并对 TP/CP rank 的稀疏边界取交集。</p></div>
+      <div class="box"><h3>Load 辅助</h3><p><code>_update_load()</code><br><code>_select_adopted_pages()</code><br><code>_queue_load()</code><br>负责 component phase、并发去重裁剪、加锁与入队。</p></div>
+      <div class="box"><h3>Offload/清理辅助</h3><p><code>_offload_node()</code><br><code>_release_pending_locks()</code><br>一个原始 node 对应一次 Backend offload 和一个 FIFO 完成结果。</p></div>
+    </div>
+    <h3 style="margin-top:22px">逐函数调用映射</h3>
+    <table><thead><tr><th>上层事件</th><th>Wrapper</th><th>UnifiedCacheLinker Backend</th><th>结果返回到 Tree</th></tr></thead><tbody>
+      <tr><td>L1 match 后查询 L3</td><td><code>match()</code></td><td><code>lookup(rid, transfers)</code></td><td>Wrapper 记录 marker，更新 <code>MatchResult.host_hit_length</code></td></tr>
+      <tr><td>将 L3 hit 接入 Device Tree</td><td><code>load_back()</code> → <code>_queue_load()</code></td><td><code>load(rid, transfers)</code></td><td>入队成功后保存 pending load；Tree 路径已发布并锁定</td></tr>
+      <tr><td>启动本调度 batch</td><td><code>start_layer_wise_loading()</code></td><td>同名方法</td><td>返回 counter index；Forward 通过 counter 等待各层</td></tr>
+      <tr><td>Load 整批完成</td><td><code>drain_loads()</code></td><td><code>num_completed_loads()</code> + <code>pop_completed_load()</code></td><td>按 rid 释放 node locks</td></tr>
+      <tr><td>Tree 请求写穿 node</td><td><code>offload_nodes()</code> → <code>_offload_node()</code></td><td><code>offload(transfers)</code></td><td>接受后设置 <code>write_through_pending_id</code>，保持 node lock</td></tr>
+      <tr><td>Offload 最终完成</td><td><code>take...</code> → 跨 rank 同步 → <code>commit...</code></td><td><code>num_completed_offloads()</code> + <code>pop_completed_offload()</code></td><td>成功才令 <code>external_cache_stored=True</code>；失败保持 False</td></tr>
+    </tbody></table>
+<div class="notice"><b>实现要求：</b>接入新 Backend 时实现 <code>UnifiedCacheLinker</code> 的 11 个抽象方法和 <code>layer_done_counter</code> 属性即可；Wrapper 由 SGLang 创建并持有 Backend。Backend 完成队列必须能与 Wrapper 的提交顺序对应，当前 offload ack 是 FIFO <code>bool</code>，没有 task/node ID。</div>
+  </section>
+
+  <section id="api" class="view card"><h2>3. UnifiedCacheLinker Backend 接口参数</h2><p class="sub">接口定义在 <code>unified_cache_linker.py</code>；Mooncake、UMBP、UCM 等外部 Backend 必须实现这些方法。</p>
     <table><thead><tr><th>接口</th><th>参数</th><th>返回值</th><th>语义 / 约束</th></tr></thead><tbody>
       <tr><td><code>lookup</code></td><td><code>rid: str</code><br><code>transfers: list[PoolTransfer]</code></td><td class="ret"><code>list[int]</code></td><td>返回本 rank 所有“完整可恢复”的前缀页数；集合允许稀疏。Wrapper 再对 TP/CP ranks 取交集。</td></tr>
       <tr><td><code>load</code></td><td><code>rid: str</code><br><code>transfers</code></td><td class="ret"><code>bool</code></td><td>仅将 L3→Device 请求入队。<code>True</code> 不表示数据已写入 device。</td></tr>
@@ -59,7 +99,7 @@
     </tbody></table>
   </section>
 
-  <section id="lookup" class="view card"><h2>3. Lookup / Match：只查询，不分配 Device slot</h2><p class="sub">输出是可恢复长度与 hit marker；Tree 还没有插入 L3 tail。</p>
+<section id="lookup" class="view card"><h2>4. Lookup / Match：只查询，不分配 Device slot</h2><p class="sub">输出是可恢复长度与 hit marker；Tree 还没有插入 L3 tail。</p>
     <div class="flow">
       <div class="node tree"><b>① Radix L1 match</b><span>得到 <code>result.device_indices</code>、<code>last_device_node</code> 和 device hit 长度。</span></div>
       <div class="node"><b>② Wrapper._tail_hashes</b><span>以最后一个 L1 hash 为 anchor，对未命中且 page 对齐的 tail 生成 storage hashes。</span></div>
@@ -71,7 +111,7 @@
     <div class="split"><div class="box"><h3>ExternalCacheHitMarker</h3><p><code>prefix_key</code>：L1 prefix + 可恢复 tail<br><code>tail_hashes</code>：仅 tail 的 page hashes<br><code>device_hit_len</code>：已有 L1 token 数</p></div><div class="box"><h3>重要结果</h3><p><code>lookup()</code> 的返回不是“KV 最大命中数”，而是所有必要 Pool 在精确边界上均可恢复的页数集合。</p></div></div>
   </section>
 
-  <section id="load" class="view card"><h2>4. Load：先建 Tree/分配 slot，再启动逐层 I/O</h2><p class="sub">绿色为 Wrapper/Tree 的准备与提交，紫色为 Backend 契约调用。</p>
+<section id="load" class="view card"><h2>5. Load：先建 Tree/分配 slot，再启动逐层 I/O</h2><p class="sub">绿色为 Wrapper/Tree 的准备与提交，紫色为 Backend 契约调用。</p>
     <div class="lane"><div class="actor">Scheduler</div><div class="steps"><div class="step load"><span class="num">1</span><div><strong><code>UnifiedRadixCache.init_load_back(params)</code></strong><small>命中 marker 后调用 <code>Wrapper.load_back(req)</code>。</small></div></div></div></div>
     <div class="lane"><div class="actor">Wrapper + Components</div><div class="steps">
       <div class="step load"><span class="num">2</span><div><strong>构造 LOAD transfers</strong><small><code>build_external_linker_transfer(LOAD, None, tail_hashes)</code>，然后 <code>update_external_linker_load(PREPARE,...)</code> 分配/准备 device slots。</small></div></div>
@@ -86,7 +126,7 @@
     <div class="lane"><div class="actor">完成回收</div><div class="steps"><div class="step load"><span class="num">8</span><div><strong>完成队列 → 释放 node lock</strong><small><code>num_completed_loads()</code> → <code>pop_completed_load()</code> → <code>Wrapper.drain_loads()</code>。注意 layer counter 管“可计算到哪层”，completed queue 管“整批可释放”。</small></div></div></div></div>
   </section>
 
-  <section id="offload" class="view card"><h2>5. Dump / Offload：Tree action 驱动的异步写穿</h2><p class="sub">抽象接口称为 offload；是否逐层 dump、对象布局和协议由具体 backend 决定，Linker 契约本身没有逐层 offload counter。</p>
+<section id="offload" class="view card"><h2>6. Dump / Offload：Tree action 驱动的异步写穿</h2><p class="sub">抽象接口称为 offload；是否逐层 dump、对象布局和协议由具体 backend 决定，Linker 契约本身没有逐层 offload counter。</p>
     <div class="flow">
       <div class="node tree"><b>① BackupKV action</b><span>Tree write-through chain 产生待持久化 <code>node_ids</code>。</span></div>
       <div class="node"><b>② 构造 transfers</b><span><code>build_external_linker_offload_transfers(node_id)</code>；已 stored/pending 的 node 被跳过。</span></div>
@@ -98,7 +138,7 @@
     <div class="notice"><b>不要混淆：</b><code>offload() == True</code> 是“任务已接受”；只有 <code>pop_completed_offload() == True</code> 才能令 <code>external_cache_stored=True</code>。Node split 时，Wrapper 会把 ack 的发布目标替换成 split 后的新 node IDs。</div>
   </section>
 
-  <section id="state" class="view card"><h2>6. Node 状态与双完成信号</h2><p class="sub">Load 与 Offload 都锁 node，但发布的状态不同。</p>
+<section id="state" class="view card"><h2>7. Node 状态与双完成信号</h2><p class="sub">Load 与 Offload 都锁 node，但发布的状态不同。</p>
     <h3>Offload 状态机</h3><div class="state">
       <div class="node"><b>L1 only</b><span><code>stored=False</code><br><code>pending=None</code></span></div>
       <div class="node"><b>Offload pending</b><span><code>stored=False</code><br><code>pending=ack_id</code><br>node locked</span></div>
