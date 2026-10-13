@@ -1047,3 +1047,47 @@ Tree 候选前缀
 `external_cache_stored=True` 只表示该节点**曾经成功发布到外部缓存**，可用于避免重复备份和管理 write-through；它不能保证对象仍存在。L3 可能发生 TTL、容量淘汰、重启或部分 TP/Sidecar 缺失，因此真正恢复前仍需要 backend lookup。
 
 > 最简化理解：Tree 知道“要查什么 Key”，Storage Backend 知道“数据实际存在哪里、现在是否还存在”。
+
+## 15. SGLang 接入 UCM 时的内存分配顺序
+
+需要区分“服务启动时创建整块内存池”和“请求运行时从池中分配槽位”。
+
+### 启动阶段
+
+```text
+创建 Device KV Pool 和 Device Allocator
+        ↓
+创建 UnifiedRadixCache
+        ↓
+根据 Device Pool 的布局和容量创建 Host Pool
+        ↓
+创建 HybridCacheController，绑定 Device/Host Pool
+        ↓
+UCM 注册各 Host Pool 的地址、大小及数据类型
+```
+
+因此，整池创建顺序是 **Device 先、Host 后**。UCM 主要管理和访问 Host Pool，不直接分配模型使用的 Device KV Cache。
+
+### 普通未命中请求
+
+```text
+分配 Device 槽位 → GPU Prefill 计算 → 按缓存策略决定是否分配 Host 槽位
+```
+
+正常推理不会同步为每个 Device Page 分配 Host Page；只有备份、下沉或恢复时才需要 Host 槽位。
+
+### Device 数据写入 UCM
+
+```text
+Device 数据已存在 → 分配 Host 槽位 → D2H → Host 数据写入 UCM
+```
+
+### 从 UCM 恢复数据
+
+```text
+查询 UCM → 确定可恢复前缀 → 分配 Host staging 槽位
+        ↓
+UCM → Host → 分配 Device 槽位 → H2D → 发布到 Radix Cache
+```
+
+所以运行时恢复顺序是 **Host 先、Device 后**。Hybrid 模型会联合分配必要的 Full KV、SWA、Mamba/State 等 Pool；任一必要 Pool 分配失败时会回滚，防止发布不完整的缓存状态。
