@@ -1186,3 +1186,29 @@ Prefetch 还受以下机制约束：
 因此，Prefetch 的核心模型是：
 
 > 后台异步执行 L3 → Host，Scheduler 不阻塞；策略只决定当前请求需要在 waiting queue 中等多久。
+
+## 18. L1/L2 Write-Through 机制
+
+在 HiCache 中，L1 通常是 GPU Device KV Cache，L2 是 CPU Host KV Cache。`write_through` 会在节点满足条件后主动保留 L1 数据，并异步复制一份到 L2：
+
+```text
+L1 节点创建或命中 → 分配 L2 槽位 → 异步 D2H → ACK 完成 → L1/L2 同时持有副本
+```
+
+- `write_through` 的触发阈值为 1；`write_through_selective` 的阈值为 2，只备份更热的节点；
+- Host 索引分配后会先挂到节点，并通过 `write_through_pending_id` 标记传输尚未完成；
+- CUDA Event 完成后清除 pending、释放节点锁，此时 L2 副本才正式可用；
+- 后续淘汰 L1 时可直接释放 Device 槽位，命中 L2 后再异步 H2D 恢复；
+- `write_back` 与之不同：通常等到 L1 即将淘汰时才执行 D2H；
+- `cache` 模式会长期保留 L2 副本；`buffer_only` 模式中的 Host 仅作为写入 UCM/L3 的临时 staging，不构成持久 L2 缓存。
+
+如果启用了外部存储，cache 模式在 D2H ACK 后还会继续异步执行 L2 → UCM/L3 写入。Hybrid 模型沿用同一套调度，同时处理 Full KV、SWA、Mamba/State 等必要 Pool。
+
+### Stream 与实际拷贝接口
+
+L1/L2 传输分别提交到独立的 `device_to_host_stream` 和 `host_to_device_stream`，但底层拷贝方式由 `hicache_io_backend` 决定：
+
+- 默认 `kernel`：在当前 Stream 上启动 `transfer_kv_*` 自定义 CUDA Kernel，按索引搬运非连续页面并处理布局转换；这是异步 Kernel launch，不是 `cudaMemcpyAsync`；
+- `direct`：调用 `transfer_kv_direct()`，内部使用 `Tensor.copy_(non_blocking=True)`；当 Host 内存为 pinned memory 且切片连续时，通常由 PyTorch/ATen 落到当前 Stream 上的 `cudaMemcpyAsync`。
+
+因此，Stream 负责依赖关系和异步执行顺序；`kernel` 与 `direct` 的区别在于实际数据搬运由自定义 CUDA Kernel 还是异步内存复制完成。
