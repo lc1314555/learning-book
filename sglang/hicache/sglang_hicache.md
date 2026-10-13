@@ -1091,3 +1091,98 @@ UCM → Host → 分配 Device 槽位 → H2D → 发布到 Radix Cache
 ```
 
 所以运行时恢复顺序是 **Host 先、Device 后**。Hybrid 模型会联合分配必要的 Full KV、SWA、Mamba/State 等 Pool；任一必要 Pool 分配失败时会回滚，防止发布不完整的缓存状态。
+
+## 16. SWA Tombstone 与 Mamba 状态管理
+
+### SWA Tombstone
+
+SWA 数据被淘汰后，Radix 节点及其 Full KV 可能仍然有效，此时只清除该节点的 SWA `value`（或将物理映射标记为 `-1`），称为 tombstone：
+
+```text
+Radix 节点仍存在
+├── Full KV：存在
+└── SWA KV：已释放（tombstone）
+```
+
+它表示“该组件数据不存在”，不是整个树节点被删除。SWA 只需要恢复边界前的尾部窗口，因此窗口之外的旧 SWA 数据可以成为 tombstone；若后续恢复范围覆盖这些位置，则需要重新计算或从 Host/UCM 恢复。
+
+### Mamba Active Slot 与 Copy-on-Write
+
+Mamba recurrent state 会随每个新 token 更新，而 Radix Cache 中的 checkpoint 可能被多个请求共享，因此缓存 checkpoint 必须保持只读。命中后，SGLang 为请求分配一个私有 Active Slot，将 checkpoint 复制进去，再在私有槽中继续更新：
+
+```text
+共享 Radix Checkpoint
+        ↓ Copy-on-Write
+请求私有 Active Slot → 后续推理持续修改
+```
+
+这样多个请求可以命中同一个 checkpoint，但不会互相覆盖状态。
+
+### Mamba Ping-Pong Tracking
+
+启用 Mamba extra buffer 时，请求还可持有一至两个 tracking slot，用于在指定前缀边界保存临时状态快照。Overlap scheduling 下通常使用两个槽交替工作：
+
+```text
+Active State → Ping 保存 State@边界1
+Active State → Pong 保存 State@边界2
+Active State → Ping 保存 State@边界3
+```
+
+一个槽保存最近已完成、可用的 checkpoint，另一个槽接收下一次快照，从而避免异步执行覆盖仍需使用的状态；若最新快照超过目标缓存边界，还可以回退到前一个快照。请求结束或插入缓存时，SGLang 选择最新且不超过目标前缀的 tracking slot，将其复制、压缩或直接转交给 Radix Cache。
+
+三类状态的关系是：
+
+```text
+Active Slot           → 当前请求持续计算
+Ping/Pong Track Slot  → 临时记录可缓存边界
+Radix Checkpoint      → 正式发布、供后续请求共享
+```
+
+## 17. Storage Prefetch 的异步调度与策略
+
+SGLang 的 Storage Prefetch 主要执行 **L3/UCM → Host**，请求真正进入 Prefill 时再执行 **Host → Device**。它不会阻塞 Scheduler 线程，而是通过后台队列和线程异步推进：
+
+```text
+请求入队并完成 L1/L2 前缀匹配
+        ↓
+Scheduler 提交 PrefetchOperation
+        ↓
+后台查询线程执行 L3 lookup，并对各 Rank 的命中长度取 MIN
+        ↓
+Scheduler 为有效命中分配 Host staging
+        ↓
+后台 I/O 线程执行 UCM/L3 → Host
+        ↓
+同步线程汇总各 Rank 的完成进度并返回 ACK
+        ↓
+Cache 模式插入 L2 Radix Cache；Buffer 模式暂存到 staging
+        ↓
+请求准入时执行 Host → Device，随后 Prefill
+```
+
+Scheduler 每次考虑该请求时调用 `check_prefetch_progress()`。如果策略要求继续等待，则只跳过当前请求并调度其他请求，不会在 Scheduler 主线程中同步等待：
+
+```python
+if not tree_cache.check_prefetch_progress(req.cache_request_handle):
+    continue
+```
+
+`--hicache-storage-prefetch-policy` 支持三种策略：
+
+| 策略 | 请求调度行为 |
+|---|---|
+| `best_effort` | 基本不持续等待；使用检查时已完成的部分，终止剩余 Prefetch 并尽快进入 Prefill |
+| `wait_complete` | Prefetch 完成前持续跳过该请求，完成后再准入，可最大化 L3 复用但可能增加 TTFT |
+| `timeout` | 完成或超时前跳过请求；超时后使用已完成部分，其余重新计算，是默认折中策略 |
+
+Prefetch 还受以下机制约束：
+
+- 待查询或实际命中长度低于 `prefetch_threshold` 时不值得传输；
+- Host staging 达到容量限制时限流，Buffer 模式中的已知命中按 FIFO 等待；
+- 查询和读取完成长度在 TP/PP/CP Rank 间取最小值；
+- Hybrid 模型还要取 Full KV、SWA、Mamba/State 及必要 Sidecar 的共同可恢复边界；
+- 暂时性 miss、异步写入尚未完成或排队期间 Device 命中缩短时，可以按配置重新发起查询。
+
+因此，Prefetch 的核心模型是：
+
+> 后台异步执行 L3 → Host，Scheduler 不阻塞；策略只决定当前请求需要在 waiting queue 中等多久。
