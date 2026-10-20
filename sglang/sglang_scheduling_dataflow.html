@@ -71,7 +71,8 @@
     <a href="#tiers">6 数据传输 L1/L2/L3</a>
     <a href="#ucm">7 L3 = UCM 适配详解</a>
     <a href="#e2e">8 端到端案例</a>
-    <a href="#index">9 溯源索引</a>
+    <a href="#roles">9 进程与角色关系</a>
+    <a href="#index">10 溯源索引</a>
   </section>
 
   <section id="overview">
@@ -338,8 +339,55 @@ sequenceDiagram
     </div>
   </section>
 
+  <section id="roles">
+    <h2><span class="k">◆</span>9. 进程与角色关系：UCM 在哪里</h2>
+    <div class="key">
+      <b>一句话：</b>UCM 不是独立进程，也不自带调度器/执行器。它是以库的形式被引擎 import，在引擎<b>已有的进程</b>内运行，复用引擎的 Scheduler 与 Worker，只通过引擎提供的接口挂进去——SGLang 是 <code>HiCacheStorage</code>，vLLM 是 <code>KVConnectorBase_V1</code>。
+    </div>
+    <div class="mermaid">
+flowchart TB
+  subgraph P1["前端进程 TokenizerManager"]
+    TM["HTTP 接收与分发"]
+  end
+  subgraph P2["Scheduler 进程 每个 TP rank 一个"]
+    SCH["Scheduler 事件循环与组批"]
+    WK["TpModelWorker 执行 forward"]
+    HC["HiCacheController 线程 prefetch 与 backup"]
+    subgraph UCMP["UCM 同进程库"]
+      US["UnifiedCacheStore 实现 HiCacheStorage"]
+      CS["UcmKVStoreBaseV1 store 与传输"]
+    end
+    SCH --> WK
+    SCH --> HC
+    HC --> US
+    US --> CS
+  end
+  subgraph P3["DetokenizerManager 进程"]
+    DET["detokenize"]
+  end
+  TM -.->|ZMQ| SCH
+  SCH -.->|ZMQ| DET
+  DET -.->|ZMQ| TM
+  CS --> EXT["L3 外部存储 NFS 对象存储 等 独立部署"]
+    </div>
+    <table>
+      <tr><th>角色</th><th>谁担任</th><th>UCM 做什么</th></tr>
+      <tr><td>请求调度</td><td>引擎 Scheduler</td><td>不参与调度，仅被回调查命中、给出 block 计划</td></tr>
+      <tr><td>模型执行</td><td>引擎 TpModelWorker / ModelRunner</td><td>不参与 forward，仅在前后搬运 KV</td></tr>
+      <tr><td>KV 搬运</td><td>UCM（同进程库）</td><td>提供 <code>lookup / load_data / dump_data</code></td></tr>
+    </table>
+    <p>UCM 自己拥有的是<b>进程内的线程与资源</b>（IO 线程池、传输引擎、任务队列），而非独立服务：<span class="src local">ucm/integration/sglang/unifiedcache_store.py:19</span>；宿主控制线程在 <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/cache_controller.py#L457" target="_blank">cache_controller.py:457</a>。</p>
+
+    <h3>vLLM 侧同理</h3>
+    <p>vLLM 的 connector 只有 <code>SCHEDULER</code> / <code>WORKER</code> 两个<b>角色</b>（<code>KVConnectorRole</code>），不是两个进程。<code>kv_role=kv_both</code> 时引擎在 Scheduler 进程与 Worker 进程各创建一个 UCM connector 实例；调度与执行仍由 vLLM 的 Scheduler / Worker 负责。</p>
+    <p><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/distributed/kv_transfer/kv_connector/v1/base.py#L139" target="_blank">base.py:139 KVConnectorRole</a> <a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/distributed/kv_transfer/kv_connector/factory.py#L43" target="_blank">factory.py:43 create_connector</a></p>
+    <div class="note">
+      <b>唯一真正跨进程/跨机的是外部存储本身：</b>NFS、对象存储、远端 peer 等是独立部署的服务；UCM 只是它们在本进程内的客户端。三个概念别混淆——<b>引擎 Scheduler</b>（决定跑什么）、<b>引擎 Worker</b>（执行 forward）、<b>UCM</b>（同进程的 KV 存储/传输后端）。
+    </div>
+  </section>
+
   <section id="index">
-    <h2><span class="k">◆</span>9. 溯源索引</h2>
+    <h2><span class="k">◆</span>10. 溯源索引</h2>
     <h3>SGLang（可点开 GitHub，commit 固定）</h3>
     <table>
       <tr><th>主题</th><th>锚点</th></tr>
