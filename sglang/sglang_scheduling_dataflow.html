@@ -1,0 +1,398 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SGLang 调度流程与数据传输（含 HiCache L3 与 UCM 适配）</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  :root{
+    --bg:#f6f8fb; --panel:#fff; --ink:#172033; --muted:#5b6475; --line:#dfe5ee;
+    --sgl:#c2410c; --sgl-bg:#fff7ed; --worker:#7c3aed; --worker-bg:#f5f3ff;
+    --ucm:#0f766e; --ucm-bg:#ecfdf5; --store:#9a3412; --store-bg:#fff7ed;
+    --warn:#b45309; --code:#eef2f7; --dark:#111827; --gold:#f59e0b; --hier:#1d4ed8; --hier-bg:#eff6ff;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;color:var(--ink);background:var(--bg);font:15px/1.68 "Segoe UI","Microsoft YaHei",Arial,sans-serif;}
+  header{background:linear-gradient(135deg,#1c1917,#111827 55%,#0f2b2a);color:#fff;padding:34px 42px 26px;border-bottom:4px solid var(--sgl);}
+  header h1{margin:0 0 10px;font-size:30px;}
+  header p{margin:4px 0;max-width:1150px;color:#cfd6e2;font-size:14px;}
+  header .meta code{background:rgba(255,255,255,.12);border-color:transparent;color:#e6edf7;}
+  main{max-width:1240px;margin:0 auto;padding:26px 26px 60px;}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:22px 24px;margin:18px 0;box-shadow:0 1px 2px rgba(17,24,39,.05);}
+  h2{margin:0 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line);font-size:22px;}
+  h2 .k{color:var(--gold);font-size:16px;margin-right:6px;}
+  h3{margin:18px 0 8px;font-size:17px;}
+  p{margin:8px 0;}
+  ul,ol{margin:8px 0 8px 22px;padding:0;}
+  li{margin:5px 0;}
+  code{background:var(--code);border:1px solid #d8dee9;border-radius:4px;padding:1px 5px;font-family:Consolas,"Cascadia Mono",monospace;font-size:.9em;}
+  pre{background:#0f172a;color:#e5e7eb;padding:14px;border-radius:6px;overflow-x:auto;font:13px/1.55 Consolas,"Cascadia Mono",monospace;}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:14px;}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top;}
+  th{background:#f1f4f8;}
+  .note{border-left:4px solid var(--ucm);background:#edfafa;padding:10px 14px;margin:12px 0;border-radius:0 6px 6px 0;}
+  .warn{border-left-color:var(--warn);background:#fff7ed;}
+  .key{border-left:4px solid var(--gold);background:#fffbeb;padding:10px 14px;margin:12px 0;border-radius:0 6px 6px 0;}
+  .src{display:inline-block;font-family:Consolas,monospace;font-size:12px;background:#eef2f7;border:1px solid #d3dae6;border-radius:5px;padding:0 6px;color:#334155;text-decoration:none;white-space:nowrap;margin:1px 0;}
+  .src:hover{background:#e2e8f0;}
+  .src.local{background:#fef3c7;border-color:#fcd34d;color:#92400e;}
+  .mermaid{background:#fbfcff;border:1px solid var(--line);border-radius:8px;padding:14px;margin:12px 0;overflow-x:auto;}
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;}
+  .card{border:1px solid var(--line);border-radius:8px;padding:14px;background:#fbfcfe;}
+  .tag{display:inline-block;padding:1px 8px;margin:2px 4px 2px 0;border:1px solid #b8c5d7;border-radius:999px;background:#f3f6fa;color:#344054;font-size:12px;}
+  .t-front{color:var(--sgl);border-color:#f5cba7;background:var(--sgl-bg);}
+  .t-worker{color:var(--worker);border-color:#d8ccfb;background:var(--worker-bg);}
+  .t-hier{color:var(--hier);border-color:#bfd3f7;background:var(--hier-bg);}
+  .t-ucm{color:var(--ucm);border-color:#a7e3d6;background:var(--ucm-bg);}
+  .toc a{color:var(--sgl);text-decoration:none;margin-right:14px;}
+  .toc a:hover{text-decoration:underline;}
+  @media (max-width:860px){header{padding:24px 18px;}.grid{grid-template-columns:1fr;}main{padding:16px 12px 40px;}section{padding:18px 14px;}}
+</style>
+</head>
+<body>
+<header>
+  <h1>SGLang 调度流程与数据传输（含 HiCache L3 与 UCM 适配）</h1>
+  <p class="meta">
+    源码基准：SGLang <code>sgl-project/sglang @ 2229345d</code>（main）；
+    L3 适配：UCM <code>ucm/integration/sglang</code>（<code>UnifiedCacheStore → SglangUcmConnector → UcmKVStoreBaseV1</code>）。
+  </p>
+  <p>目标：讲清一条请求在 SGLang 里如何被调度、批如何形成与执行、KV 如何在 <b>L1 Device / L2 Host / L3 外部存储</b> 间流动，以及 UCM 如何插在 L3。每一步都标注可溯源行号。</p>
+</header>
+
+<main>
+  <section class="toc">
+    <strong>目录：</strong>
+    <a href="#overview">1 总览</a>
+    <a href="#schedule">2 调度主流程</a>
+    <a href="#lifecycle">3 请求生命周期</a>
+    <a href="#prefix">4 前缀缓存命中</a>
+    <a href="#memory">5 显存不足与 retract</a>
+    <a href="#tiers">6 数据传输 L1/L2/L3</a>
+    <a href="#ucm">7 L3 = UCM 适配详解</a>
+    <a href="#e2e">8 端到端案例</a>
+    <a href="#index">9 溯源索引</a>
+  </section>
+
+  <section id="overview">
+    <h2><span class="k">◆</span>1. 一张总览图</h2>
+    <p>SGLang 是「前端 <b>TokenizerManager</b> → 每 TP/DP rank 一个 <b>Scheduler</b>（内含 <b>TpModelWorker</b> 与模型）→ <b>DetokenizerManager</b>」的进程结构，进程间用 ZMQ 传消息。KV 走 <b>HiCache</b> 三层：L1 Device KV 池、L2 HostKVCache（CPU 内存）、L3 HiCacheStorage（UCM）。</p>
+    <div class="mermaid">
+flowchart TB
+  subgraph FE["前端进程 TokenizerManager"]
+    H["HTTP generate_request"] --> DISP["_dispatch_to_scheduler"]
+    LOOP2["handle_loop 收 detokenizer 输出"]
+  end
+  subgraph SC["Scheduler 进程"]
+    IPC["SchedulerIpcChannels"]
+    RECV["recv_requests"]
+    ING["ingest_requests"]
+    PLN["get_next_batch_to_run"]
+    RB["run_batch"]
+    PBR["process_batch_result"]
+  end
+  subgraph WK["TpModelWorker"]
+    FB["forward_batch_generation"]
+    MR["ModelRunner forward 与 sample"]
+    L1["L1 Device KV 池 GPU"]
+  end
+  subgraph DE["DetokenizerManager"]
+    DET["event_loop detokenize"]
+  end
+  DISP -.->|ZMQ PUSH| IPC
+  IPC --> RECV --> ING --> PLN --> RB --> PBR
+  RB --> FB --> MR --> L1
+  PBR -.->|ZMQ PUSH| DET
+  DET -.->|ZMQ PUSH| LOOP2
+  PLN -.->|match_prefix| RC["RadixCache 前缀树"]
+  L1 <-->|L2TransferEngine 备份 回载| L2["L2 HostKVCache CPU 内存"]
+  L2 <-->|HiCacheController 读写| L3["L3 HiCacheStorage UCM Store"]
+    </div>
+    <p><span class="tag t-front">前端</span> 橙=TokenizerManager；<span class="tag t-worker">执行</span> 紫=Scheduler/TpModelWorker；<span class="tag t-hier">分层</span> 蓝=HiCache L1/L2；<span class="tag t-ucm">L3</span> 绿=UCM Store。</p>
+  </section>
+
+  <section id="schedule">
+    <h2><span class="k">◆</span>2. 调度主流程</h2>
+    <p>关键点：<b>调度（组 batch + 缓存命中 + 显存校验）全在 Scheduler 的事件循环里完成；模型执行由它同步驱动的 TpModelWorker 承担；输出经 Detokenizer 回到前端。</b></p>
+    <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant U as HTTP Client
+  participant TM as TokenizerManager
+  participant S as Scheduler
+  participant W as TpModelWorker
+  participant D as DetokenizerManager
+  U->>TM: POST generate
+  TM->>S: ZMQ PUSH request
+  loop 调度事件循环
+    S->>S: ingest_requests
+    S->>S: get_next_batch_to_run
+    Note over S: 命中 RadixCache 缩短 prefill
+    S->>W: run_batch forward_batch_generation
+    W->>W: ModelRunner forward 与 sample
+    W-->>S: GenerationBatchResult
+    S->>S: process_batch_result
+    S->>D: ZMQ PUSH output
+    D->>TM: ZMQ PUSH detokenized
+    TM-->>U: 流式返回 token
+  end
+    </div>
+    <h3>调用链与源码锚点</h3>
+    <table>
+      <tr><th>阶段</th><th>函数</th><th>锚点</th></tr>
+      <tr><td>入口</td><td>TokenizerManager.generate_request</td>
+        <td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/tokenizer_manager.py#L910" target="_blank">tokenizer_manager.py:910</a></td></tr>
+      <tr><td>进程 IPC</td><td>init_ipc_channels / SchedulerIpcChannels.create</td>
+        <td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/tokenizer_manager.py#L675" target="_blank">tokenizer_manager.py:675</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler_components/ipc_channels.py#L25" target="_blank">ipc_channels.py:25</a></td></tr>
+      <tr><td>事件循环</td><td>Scheduler.run_event_loop / event_loop_normal</td>
+        <td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler.py#L1925" target="_blank">scheduler.py:1925</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler.py#L1976" target="_blank">:1976</a></td></tr>
+      <tr><td>收请求</td><td>ingest_requests / recv_requests</td>
+        <td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler.py#L2134" target="_blank">scheduler.py:2134</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler_components/request_receiver.py#L80" target="_blank">request_receiver.py:80</a></td></tr>
+      <tr><td>选批</td><td>get_next_batch_to_run</td>
+        <td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler.py#L3829" target="_blank">scheduler.py:3829</a></td></tr>
+      <tr><td>Prefill 组批</td><td>get_new_batch_prefill / _get_new_batch_prefill_raw</td>
+        <td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler.py#L3991" target="_blank">scheduler.py:3991</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler.py#L4018" target="_blank">:4018</a></td></tr>
+      <tr><td>Decode 维护</td><td>update_running_batch</td>
+        <td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler.py#L4398" target="_blank">scheduler.py:4398</a></td></tr>
+      <tr><td>执行</td><td>run_batch / forward_batch_generation</td>
+        <td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler.py#L4553" target="_blank">scheduler.py:4553</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/tp_worker.py#L279" target="_blank">tp_worker.py:279</a></td></tr>
+      <tr><td>取回结果</td><td>process_batch_result</td>
+        <td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler.py#L5010" target="_blank">scheduler.py:5010</a></td></tr>
+      <tr><td>解码回传</td><td>DetokenizerManager.event_loop</td>
+        <td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/detokenizer_manager.py#L180" target="_blank">detokenizer_manager.py:180</a></td></tr>
+    </table>
+  </section>
+
+  <section id="lifecycle">
+    <h2><span class="k">◆</span>3. 请求生命周期（Req）</h2>
+    <p>请求进入后先落到 <code>waiting_queue</code>，被调度进 batch 后成为 running；显存不足时可能被 <code>retract</code> 退回等待。核心数据是 <code>Req</code> 与 <code>ScheduleBatch</code>。</p>
+    <div class="mermaid">
+stateDiagram-v2
+  [*] --> WAITING
+  WAITING --> RUNNING: 被调度进入 batch
+  RUNNING --> RUNNING: decode 逐步生成 token
+  RUNNING --> RETRACTED: 显存不足 retract_decode
+  RETRACTED --> WAITING: 释放后重新入队
+  RUNNING --> FINISHED: 命中停止条件或达最大长度
+  FINISHED --> [*]
+    </div>
+    <p>锚点：<a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/schedule_batch.py#L1050" target="_blank">schedule_batch.py:1050 Req</a>、<a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/schedule_batch.py#L2447" target="_blank">:2447 ScheduleBatch</a>；组批 <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/schedule_batch.py#L2839" target="_blank">:2839 prepare_for_extend</a> / <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/schedule_batch.py#L3685" target="_blank">:3685 prepare_for_decode</a>。</p>
+  </section>
+
+  <section id="prefix">
+    <h2><span class="k">◆</span>4. 前缀缓存命中如何缩短 prefill（重点）</h2>
+    <div class="key">
+      <b>核心机制：</b>每个候选请求组批前先做 <code>RadixCache.match_prefix</code>，命中的 token 无需重算——<code>prefix_lens</code> 变大、<code>extend_lens</code> 变小，prefill 只处理未命中后缀。这是 SGLang 高缓存命中率的关键。
+    </div>
+    <div class="mermaid">
+flowchart LR
+  A["waiting_queue 候选 Req"] --> B["init_next_round_input"]
+  B --> C["match_kv_cache 调 tree_cache.match_prefix"]
+  C --> D["得到 prefix_len 与命中节点"]
+  D --> E["prepare_for_extend 只填充未命中后缀"]
+  E --> F["alloc_for_extend 写 KV 索引"]
+    </div>
+    <p>锚点：<a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/common.py#L220" target="_blank">common.py:220 match_kv_cache</a>、<a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/radix_cache.py#L364" target="_blank">radix_cache.py:364 match_prefix</a>、<a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/allocation.py#L374" target="_blank">allocation.py:374 alloc_for_extend</a>。</p>
+  </section>
+
+  <section id="memory">
+    <h2><span class="k">◆</span>5. 显存不足与 retract</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>检测</h3>
+        <p>Decode 前调用 <code>check_decode_mem</code>，底层用 <code>check_decode_capacity</code> 判断空闲 KV 是否够本步增长。</p>
+        <p><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/schedule_batch.py#L3401" target="_blank">schedule_batch.py:3401</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/allocator/base.py#L171" target="_blank">allocator/base.py:171</a></p>
+      </div>
+      <div class="card">
+        <h3>退让</h3>
+        <p>不足则 <code>retract_decode</code>：把部分请求移出 batch、释放其 KV（可备份后回收），稍后重排，保证其余请求持续产出。</p>
+        <p><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/schedule_batch.py#L3420" target="_blank">schedule_batch.py:3420</a></p>
+      </div>
+    </div>
+  </section>
+
+  <section id="tiers">
+    <h2><span class="k">◆</span>6. 数据传输：L1 / L2 / L3（HiCache）</h2>
+    <div class="note warn">
+      <b>命名澄清：</b>SGLang 用 <b>HiCache</b> 表达分层缓存，代码里是 <code>Device KV pool（L1）</code>、<code>HostKVCache（L2，CPU）</code>、<code>HiCacheStorage（L3，外部）</code>。UCM 实现的正是 <code>HiCacheStorage</code> 这个 L3 接口。
+    </div>
+    <div class="mermaid">
+flowchart LR
+  L1["L1 Device KV 池 GPU 显存"] <-->|L2TransferEngine 备份与回载| L2["L2 HostKVCache CPU 内存"]
+  L2 <-->|HiCacheController 与 HiCacheStorage| L3["L3 外部存储 UCM Store"]
+    </div>
+    <table>
+      <tr><th>层级</th><th>介质</th><th>内容</th><th>迁移</th><th>关键锚点</th></tr>
+      <tr><td><b>L1</b></td><td>GPU 显存</td><td>running batch 的 KV</td><td>模型读写</td>
+        <td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/memory_pool.py" target="_blank">mem_cache/memory_pool.py</a></td></tr>
+      <tr><td><b>L2</b></td><td>CPU 内存</td><td>可复用 KV 的宿主池</td><td>L1↔L2</td>
+        <td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/pool_host/base.py#L162" target="_blank">pool_host/base.py:162 HostKVCache</a></td></tr>
+      <tr><td><b>L3</b></td><td>外部存储</td><td>跨请求/跨实例复用的 prefix KV</td><td>L2↔L3</td>
+        <td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/hicache_storage.py#L176" target="_blank">hicache_storage.py:176 HiCacheStorage</a></td></tr>
+    </table>
+    <h3>6.1 L1↔L2（Device ↔ Host）</h3>
+    <p><code>L2TransferEngine</code> 提交 Device→Host 备份 / Host→Device 回载；实际搬运由 <code>HostKVCache.backup_from_device_all_layer</code> / <code>load_to_device_per_layer</code> 完成。</p>
+    <p><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/l2_transfer.py#L52" target="_blank">l2_transfer.py:52 L2TransferEngine</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/l2_transfer.py#L132" target="_blank">:132 submit_device_to_host</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/pool_host/base.py#L400" target="_blank">pool_host/base.py:400</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/pool_host/base.py#L384" target="_blank">:384</a></p>
+    <h3>6.2 L2↔L3（Host ↔ Storage）</h3>
+    <p><code>HiCacheController</code> 用后台线程驱动：写回（prefetch/write_storage）、淘汰（evict_host）。真正落到外部存储走 <code>HiCacheStorage</code> 的 <code>batch_get_v1/batch_set_v1</code>（零拷贝）或 v2 池接口。</p>
+    <p><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/cache_controller.py#L295" target="_blank">cache_controller.py:295 HiCacheController</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/cache_controller.py#L1024" target="_blank">:1024 evict_host</a></p>
+    <div class="note">
+      <b>调度只负责“何时搬”，不搬数据：</b>缓存命中判断在组批时（<code>UnifiedRadixCache.match_prefix</code>），回载/落盘由 <code>check_hicache_events</code> / <code>flush_pending_backups</code> 在事件循环里推进。
+      <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/unified_radix_cache.py#L191" target="_blank">unified_radix_cache.py:191</a>
+      <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/unified_radix_cache.py#L3589" target="_blank">:3589</a>
+      <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/unified_radix_cache.py#L3647" target="_blank">:3647</a>
+    </div>
+  </section>
+
+  <section id="ucm">
+    <h2><span class="k">◆</span>7. L3 = UCM 适配详解</h2>
+    <p>UCM 以 <code>UnifiedCacheStore(HiCacheStorage)</code> 接入 SGLang 的 L3 接口，内部委托给 <code>SglangUcmConnector</code>，最终调用 UCM 的 <code>UcmKVStoreBaseV1.lookup / load_data / dump_data</code>。粒度是 <b>page</b>（一页一对象；非 MLA 为 K/V 两个载荷，MLA 为单载荷）。</p>
+
+    <h3>7.1 读取路径（L3 → L2，命中回载）</h3>
+    <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant HC as HiCacheController
+  participant US as UnifiedCacheStore
+  participant UC as SglangUcmConnector
+  participant ST as UCM Store
+  HC->>US: batch_get_v1 keys host_indices
+  US->>UC: batch_get_v1
+  UC->>UC: 生成物理 key 并 md5 编码
+  UC->>ST: load_data 然后 wait
+  ST-->>UC: KV 写入 HostKVCache
+  UC-->>US: 成功
+  US-->>HC: 成功
+    </div>
+    <p>锚点：<span class="src local">unifiedcache_store.py:103 batch_get_v1</span> → <span class="src local">ucm_connector.py:556 batch_get_v1</span> → <span class="src local">:538 _generate_task</span> → <span class="src local">:509 _encode_key</span>。</p>
+
+    <h3>7.2 落盘路径（L2 → L3，缓存新 KV）</h3>
+    <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant HC as HiCacheController
+  participant US as UnifiedCacheStore
+  participant UC as SglangUcmConnector
+  participant ST as UCM Store
+  HC->>US: batch_set_v1 keys host_indices
+  US->>UC: batch_set_v1
+  UC->>ST: dump_data 然后 wait
+  ST-->>UC: KV 落盘完成
+  UC-->>US: 成功
+    </div>
+    <p>锚点：<span class="src local">unifiedcache_store.py:111 batch_set_v1</span> → <span class="src local">ucm_connector.py:584 batch_set_v1</span>。</p>
+
+    <h3>7.3 关键机制</h3>
+    <div class="grid">
+      <div class="card">
+        <h3>接入方式</h3>
+        <p>实现 <code>HiCacheStorage</code> 抽象类；经典 <code>get/set</code> 刻意不实现，只支持零拷贝 <code>batch_get_v1/batch_set_v1</code> 与 v2 池 <code>batch_get_v2/batch_set_v2/batch_exists_v2</code>。</p>
+        <p><span class="src local">unifiedcache_store.py:19 / :103 / :111 / :89 / :96</span></p>
+      </div>
+      <div class="card">
+        <h3>key 生成</h3>
+        <p>SGLang 逻辑块 hash 串 → 加 <code>config_suffix</code>（模型/TP 维度）→ <code>md5</code> 成 16 字节作为 UCM key。</p>
+        <p><span class="src local">ucm_connector.py:515 后缀</span> <span class="src local">:521 物理 key</span> <span class="src local">:509 md5</span></p>
+      </div>
+      <div class="card">
+        <h3>存在性查询</h3>
+        <p><code>exists</code> 用 <code>store.lookup</code> 单点查；<code>batch_exists</code> 用 <code>store.lookup_on_prefix</code> 求连续前缀长度。</p>
+        <p><span class="src local">ucm_connector.py:612 exists</span> <span class="src local">:622 batch_exists</span></p>
+      </div>
+      <div class="card">
+        <h3>配置与注册</h3>
+        <p>经 <code>kv_connector_extra_config</code> 或环境变量 <code>UNIFIEDCACHE_CONFIG_FILE</code> 传 UCM 配置；SGLang 侧通过 patch 把 <code>unifiedcache</code> 注册为 HiCache 后端。</p>
+        <p><span class="src local">ucm_connector.py:46 / :72</span> <span class="src local">patch/0.5.5/sglang-adapt.patch</span></p>
+      </div>
+    </div>
+    <div class="note">
+      <b>进阶（规划中）：Direct Linker。</b>SGLang 已有 <code>UnifiedCacheLinker</code> 抽象（<code>lookup / load / offload / start_layer_wise_loading</code>），可让 UCM 直连 Device Pool 而不经 HostPool；当前 UCM SGLang 集成仍是 HiCache 路径。
+      <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/unified_cache/unified_cache_linker.py#L131" target="_blank">unified_cache_linker.py:131</a>
+    </div>
+  </section>
+
+  <section id="e2e">
+    <h2><span class="k">◆</span>8. 端到端案例：命中 L2/L3 的请求</h2>
+    <p>请求的 prompt 前段此前已被缓存：GPU 未命中，但 L2/L3 有对应 page，可回载后只算未命中后缀。</p>
+    <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant R as 新请求
+  participant S as Scheduler
+  participant RC as RadixCache
+  participant HC as HiCacheController
+  participant UC as UCM
+  R->>S: 入 waiting_queue
+  S->>RC: match_prefix
+  RC-->>S: GPU 命中 0 但 Host 命中若干 page
+  S->>HC: ready_to_load_host_cache
+  HC->>UC: batch_get_v1 回载命中 page
+  Note over S: prefill 只计算未命中部分
+  S->>S: run_batch 执行并采样
+  S->>HC: flush_pending_backups
+  HC->>UC: batch_set_v1 新 KV 落盘
+  S-->>R: 流式输出 token
+    </div>
+    <div class="key">
+      <b>收益与代价：</b>命中把「重算 prefill」变成「回载 KV」，用存储/带宽换算力；代价是回载延迟，因此需靠 <code>HiCacheController</code> 的预取与写回策略平衡。op 级 <code>wait</code> 使当前 UCM 路径表现为同步——Direct Linker 会改为异步任务队列。
+    </div>
+  </section>
+
+  <section id="index">
+    <h2><span class="k">◆</span>9. 溯源索引</h2>
+    <h3>SGLang（可点开 GitHub，commit 固定）</h3>
+    <table>
+      <tr><th>主题</th><th>锚点</th></tr>
+      <tr><td>入口 / IPC</td><td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/tokenizer_manager.py#L910" target="_blank">tokenizer_manager.py:910</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler_components/ipc_channels.py#L17" target="_blank">ipc_channels.py:17</a></td></tr>
+      <tr><td>事件循环</td><td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler.py#L1976" target="_blank">scheduler.py:1976</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler.py#L2011" target="_blank">:2011 overlap</a></td></tr>
+      <tr><td>选批 / 组批</td><td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler.py#L3829" target="_blank">scheduler.py:3829</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/scheduler.py#L4018" target="_blank">:4018</a></td></tr>
+      <tr><td>前缀缓存</td><td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/radix_cache.py#L364" target="_blank">radix_cache.py:364</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/common.py#L220" target="_blank">common.py:220</a></td></tr>
+      <tr><td>执行 / 采样</td><td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/model_executor/model_runner.py#L1810" target="_blank">model_runner.py:1810 forward</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/model_executor/model_runner.py#L2095" target="_blank">:2095 sample</a></td></tr>
+      <tr><td>显存校验</td><td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/allocator/base.py#L171" target="_blank">allocator/base.py:171</a></td></tr>
+      <tr><td>HiCache 分层</td><td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/hicache_storage.py#L176" target="_blank">hicache_storage.py:176</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/unified_radix_cache.py#L191" target="_blank">unified_radix_cache.py:191</a></td></tr>
+      <tr><td>L1↔L2 传输</td><td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/l2_transfer.py#L52" target="_blank">l2_transfer.py:52</a> <a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/pool_host/base.py#L162" target="_blank">pool_host/base.py:162</a></td></tr>
+      <tr><td>L2↔L3 控制</td><td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/managers/cache_controller.py#L295" target="_blank">cache_controller.py:295</a></td></tr>
+      <tr><td>L3 后端注册</td><td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/storage/backend_factory.py#L16" target="_blank">storage/backend_factory.py:16</a></td></tr>
+      <tr><td>Direct Linker 抽象</td><td><a class="src" href="https://github.com/sgl-project/sglang/blob/2229345dff2753423de5d8f6cb2513824a11c18d/python/sglang/srt/mem_cache/unified_cache/unified_cache_linker.py#L131" target="_blank">unified_cache_linker.py:131</a></td></tr>
+    </table>
+    <h3>UCM（本地仓 <code>C:\github项目\lc-unified\unified-cache-management</code>，未推送到可用远程 commit，故用本地 path:line）</h3>
+    <table>
+      <tr><th>主题</th><th>锚点</th></tr>
+      <tr><td>L3 入口类</td><td><span class="src local">ucm/integration/sglang/unifiedcache_store.py:19</span></td></tr>
+      <tr><td>注册宿主池</td><td><span class="src local">unifiedcache_store.py:46</span> · <span class="src local">:73 register_mem_host_pool_v2</span></td></tr>
+      <tr><td>读取路径</td><td><span class="src local">unifiedcache_store.py:103</span> → <span class="src local">ucm_connector.py:556</span> → <span class="src local">:575 load_data</span></td></tr>
+      <tr><td>落盘路径</td><td><span class="src local">unifiedcache_store.py:111</span> → <span class="src local">ucm_connector.py:584</span> → <span class="src local">:603 dump_data</span></td></tr>
+      <tr><td>连接器</td><td><span class="src local">ucm_connector.py:140 SglangUcmConnector</span> · <span class="src local">:177 from_hicache</span></td></tr>
+      <tr><td>key 生成</td><td><span class="src local">ucm_connector.py:509 md5</span> · <span class="src local">:515 后缀</span> · <span class="src local">:521 物理 key</span></td></tr>
+      <tr><td>存在性</td><td><span class="src local">ucm_connector.py:612 exists</span> · <span class="src local">:622 batch_exists</span></td></tr>
+      <tr><td>v2 混合池</td><td><span class="src local">ucm_connector.py:342 batch_io_v2</span> · <span class="src local">:430 batch_exists_v2</span></td></tr>
+      <tr><td>配置</td><td><span class="src local">ucm_connector.py:46 / :72</span> · <span class="src local">patch/0.5.5/sglang-adapt.patch</span></td></tr>
+    </table>
+    <div class="note">
+      链接有效性：SGLang 链接指向固定 commit <code>2229345d</code>，可长期复现；UCM 当前工作树未推送到远程可用分支，故展示本地路径，需在本机 <code>C:\github项目\lc-unified\unified-cache-management</code> 内按行号定位。
+    </div>
+  </section>
+</main>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "base",
+    themeVariables: {
+      fontFamily: '"Segoe UI","Microsoft YaHei",Arial,sans-serif',
+      primaryColor: "#fff7ed",
+      primaryBorderColor: "#c2410c",
+      primaryTextColor: "#172033",
+      lineColor: "#64748b",
+      secondaryColor: "#ecfdf5",
+      tertiaryColor: "#eff6ff",
+      noteBkgColor: "#fffbeb",
+      noteBorderColor: "#f59e0b"
+    },
+    flowchart: { curve: "basis", htmlLabels: true },
+    sequence: { useMaxWidth: true, wrap: true },
+    securityLevel: "loose"
+  });
+</script>
+</body>
+</html>

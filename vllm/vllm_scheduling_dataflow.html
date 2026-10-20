@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vLLM 调度流程与数据传输（含 L3 外部 KV 缓存）</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  :root{
+    --bg:#f6f8fb; --panel:#fff; --ink:#172033; --muted:#5b6475; --line:#dfe5ee;
+    --vllm:#1d4ed8; --vllm-bg:#eff6ff; --worker:#7c3aed; --worker-bg:#f5f3ff;
+    --ucm:#0f766e; --ucm-bg:#ecfdf5; --store:#9a3412; --store-bg:#fff7ed;
+    --warn:#b45309; --code:#eef2f7; --dark:#111827; --gold:#f59e0b;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;color:var(--ink);background:var(--bg);font:15px/1.68 "Segoe UI","Microsoft YaHei",Arial,sans-serif;}
+  header{background:linear-gradient(135deg,#0b1220,#111827 55%,#0f2b2a);color:#fff;padding:34px 42px 26px;border-bottom:4px solid var(--ucm);}
+  header h1{margin:0 0 10px;font-size:30px;}
+  header p{margin:4px 0;max-width:1150px;color:#cfd6e2;font-size:14px;}
+  header .meta code{background:rgba(255,255,255,.12);border-color:transparent;color:#e6edf7;}
+  main{max-width:1240px;margin:0 auto;padding:26px 26px 60px;}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:22px 24px;margin:18px 0;box-shadow:0 1px 2px rgba(17,24,39,.05);}
+  h2{margin:0 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line);font-size:22px;}
+  h2 .k{color:var(--gold);font-size:16px;margin-right:6px;}
+  h3{margin:18px 0 8px;font-size:17px;}
+  p{margin:8px 0;}
+  ul,ol{margin:8px 0 8px 22px;padding:0;}
+  li{margin:5px 0;}
+  code{background:var(--code);border:1px solid #d8dee9;border-radius:4px;padding:1px 5px;font-family:Consolas,"Cascadia Mono",monospace;font-size:.9em;}
+  pre{background:#0f172a;color:#e5e7eb;padding:14px;border-radius:6px;overflow-x:auto;font:13px/1.55 Consolas,"Cascadia Mono",monospace;}
+  table{width:100%;border-collapse:collapse;margin:10px 0;font-size:14px;}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top;}
+  th{background:#f1f4f8;}
+  .note{border-left:4px solid var(--ucm);background:#edfafa;padding:10px 14px;margin:12px 0;border-radius:0 6px 6px 0;}
+  .warn{border-left-color:var(--warn);background:#fff7ed;}
+  .key{border-left:4px solid var(--gold);background:#fffbeb;padding:10px 14px;margin:12px 0;border-radius:0 6px 6px 0;}
+  .src{display:inline-block;font-family:Consolas,monospace;font-size:12px;background:#eef2f7;border:1px solid #d3dae6;border-radius:5px;padding:0 6px;color:#334155;text-decoration:none;white-space:nowrap;}
+  .src:hover{background:#e2e8f0;}
+  .src.local{background:#fef3c7;border-color:#fcd34d;color:#92400e;}
+  .mermaid{background:#fbfcff;border:1px solid var(--line);border-radius:8px;padding:14px;margin:12px 0;overflow-x:auto;}
+  .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;}
+  .card{border:1px solid var(--line);border-radius:8px;padding:14px;background:#fbfcfe;}
+  .tag{display:inline-block;padding:1px 8px;margin:2px 4px 2px 0;border:1px solid #b8c5d7;border-radius:999px;background:#f3f6fa;color:#344054;font-size:12px;}
+  .t-vllm{color:var(--vllm);border-color:#bfd3f7;background:var(--vllm-bg);}
+  .t-worker{color:var(--worker);border-color:#d8ccfb;background:var(--worker-bg);}
+  .t-ucm{color:var(--ucm);border-color:#a7e3d6;background:var(--ucm-bg);}
+  .t-store{color:var(--store);border-color:#f5cba7;background:var(--store-bg);}
+  .toc a{color:var(--vllm);text-decoration:none;margin-right:14px;}
+  .toc a:hover{text-decoration:underline;}
+  @media (max-width:860px){header{padding:24px 18px;}.grid{grid-template-columns:1fr;}main{padding:16px 12px 40px;}section{padding:18px 14px;}}
+</style>
+</head>
+<body>
+<header>
+  <h1>vLLM 调度流程与数据传输（含 L3 外部 KV 缓存）</h1>
+  <p class="meta">
+    源码基准：vLLM <code>lc1314555/vllm @ e4a676cdc22f</code>（main，V1 引擎）；
+    L3 对接：UCM <code>unified-cache-management @ d87b226</code>（<code>ucm/integration/vllm</code>）。
+  </p>
+  <p>目标：用「一张总览图 + 调度时序 + 状态机 + L1/L2/L3 传输矩阵 + UCM load/dump 时序」把一条请求从进入到落盘讲清楚，并给每一步标注可溯源行号。</p>
+</header>
+
+<main>
+  <section class="toc">
+    <strong>目录：</strong>
+    <a href="#overview">1 总览</a>
+    <a href="#schedule">2 调度主流程</a>
+    <a href="#state">3 请求状态机</a>
+    <a href="#preempt">4 抢占与 KV 分配</a>
+    <a href="#tiers">5 数据传输 L1/L2/L3</a>
+    <a href="#ucm">6 L3 = UCM 传输详解</a>
+    <a href="#e2e">7 端到端案例</a>
+    <a href="#index">8 溯源索引</a>
+  </section>
+
+  <section id="overview">
+    <h2><span class="k">◆</span>1. 一张总览图</h2>
+    <p>vLLM V1 分为「前端进程（API/EngineClient）」「引擎进程 EngineCore（含 Scheduler）」「Worker 进程（GPU）」三块，进程间用 ZMQ 传消息。KV 数据则在 <b>L1(HBM) / L2(CPU) / L3(外部存储)</b> 之间流动，L3 由 UCM Connector 对接。</p>
+    <div class="mermaid">
+flowchart TB
+  subgraph FE["前端进程 API Server"]
+    C["Client / OpenAI API"] --> AL["AsyncLLM.generate()"]
+    AL --> OP["OutputProcessor<br/>detokenize"]
+  end
+  subgraph EC["引擎进程 EngineCore"]
+    IQ["input_queue"] --> BL["run_busy_loop()"]
+    BL --> SCH["Scheduler.schedule()"]
+    SCH --> KVM["KVCacheManager.allocate_slots()"]
+  end
+  AL -.->|ADD via ZMQ| IQ
+  SCH --> SO["SchedulerOutput"]
+  SO --> EX["Executor.execute_model()"]
+  subgraph WK["Worker 进程 GPU"]
+    EX --> MR["GPUModelRunner.execute_model()"]
+    MR --> L1["L1: GPU HBM<br/>paged KV cache"]
+    MR --> OUT["ModelRunnerOutput"]
+  end
+  KVM --> L1
+  SCH <-.->|命中回调与 metadata| UC["KVConnector UCM"]
+  UC <==>|load_data / dump_data| L3["L3: UCM Store<br/>Cache / Posix / NFS / Mooncake"]
+  L1 <-.->|L1 到 L2 拷贝| L2["L2: CPU DRAM<br/>pinned / shared region"]
+  L2 <-.->|L2 到 L3 传输| L3
+  OUT --> BL
+    </div>
+    <p><span class="tag t-vllm">控制面</span> 蓝=vLLM 调度/引擎；<span class="tag t-worker">执行面</span> 紫=Worker/模型执行；<span class="tag t-ucm">传输面</span> 绿=UCM Connector；<span class="tag t-store">存储面</span> 橙=外部 Store。</p>
+  </section>
+
+  <section id="schedule">
+    <h2><span class="k">◆</span>2. 调度主流程（一次 <code>step()</code> 端到端）</h2>
+    <p>关键点：<b>调度与 KV 分配在 Scheduler 里完成；L3 命中判断在同一步内由 Connector 回调；真正搬运数据发生在 Worker。</b></p>
+    <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant API as API / AsyncLLM
+  participant EC as EngineCore loop
+  participant S as Scheduler
+  participant KV as KVCacheManager
+  participant UC as UCM Connector
+  participant EX as Executor
+  participant W as Worker GPU
+  API->>EC: add_request (ZMQ ADD)
+  EC->>S: add_request()
+  Note over S: 入 waiting 队列
+  loop 每个 step
+    EC->>S: schedule()
+    S->>UC: get_num_new_matched_tokens()
+    UC-->>S: 外部命中 token 数
+    S->>KV: allocate_slots()
+    KV-->>S: KVCacheBlocks 或 None
+    Note over S: 返回 None 则抢占
+    S->>UC: update_state_after_alloc()
+    S->>UC: build_connector_meta()
+    S-->>EC: SchedulerOutput
+    EC->>EX: execute_model(SchedulerOutput)
+    EX->>W: execute_model()
+    W->>UC: start_load_kv() L3→L1
+    W->>W: model forward
+    W->>UC: wait_for_save() L1→L3 dump
+    W-->>EC: ModelRunnerOutput
+    EC->>S: update_from_output()
+    S-->>API: EngineCoreOutputs 到 RequestOutput
+  end
+    </div>
+    <h3>调用链与源码锚点</h3>
+    <table>
+      <tr><th>阶段</th><th>函数</th><th>锚点</th></tr>
+      <tr><td>入口装配</td><td>AsyncLLM.add_request → process_inputs</td>
+        <td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/engine/async_llm.py#L397" target="_blank">async_llm.py:397</a></td></tr>
+      <tr><td>主循环</td><td>EngineCore.run_busy_loop / _process_engine_step</td>
+        <td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/engine/core.py#L1589" target="_blank">core.py:1589</a> <a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/engine/core.py#L1645" target="_blank">core.py:1645</a></td></tr>
+      <tr><td>单步执行</td><td>EngineCore.step()</td>
+        <td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/engine/core.py#L640" target="_blank">core.py:640</a></td></tr>
+      <tr><td>调度</td><td>Scheduler.schedule()</td>
+        <td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L621" target="_blank">scheduler.py:621</a></td></tr>
+      <tr><td>L3 命中回调</td><td>connector.get_num_new_matched_tokens()</td>
+        <td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L1034" target="_blank">scheduler.py:1034</a></td></tr>
+      <tr><td>KV 分配</td><td>KVCacheManager.allocate_slots()</td>
+        <td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/kv_cache_manager.py#L371" target="_blank">kv_cache_manager.py:371</a></td></tr>
+      <tr><td>分配后通知</td><td>connector.update_state_after_alloc()</td>
+        <td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L1346" target="_blank">scheduler.py:1346</a></td></tr>
+      <tr><td>生成 metadata</td><td>connector.build_connector_meta()</td>
+        <td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L1641" target="_blank">scheduler.py:1641</a></td></tr>
+      <tr><td>模型执行</td><td>GPUModelRunner.execute_model → sample_tokens</td>
+        <td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/worker/gpu_model_runner.py#L3935" target="_blank">gpu_model_runner.py:3935</a> <a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/worker/gpu_model_runner.py#L4299" target="_blank">:4299</a></td></tr>
+      <tr><td>回收 token</td><td>Scheduler.update_from_output()</td>
+        <td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L2110" target="_blank">scheduler.py:2110</a></td></tr>
+    </table>
+  </section>
+
+  <section id="state">
+    <h2><span class="k">◆</span>3. 请求状态机</h2>
+    <p>UCM 异步加载会引入 <code>WAITING_FOR_REMOTE_KVS</code> 状态——请求在外部 KV 就绪前不进入 forward。</p>
+    <div class="mermaid">
+stateDiagram-v2
+  [*] --> WAITING
+  WAITING --> RUNNING: 分配 slot 成功
+  WAITING --> WAITING_FOR_REMOTE_KVS: 命中 L3 且异步加载
+  WAITING_FOR_REMOTE_KVS --> RUNNING: get_finished 报告 KV 就绪
+  RUNNING --> PREEMPTED: 显存不足被抢占
+  PREEMPTED --> WAITING
+  RUNNING --> FINISHED_STOPPED: 命中停止串
+  RUNNING --> FINISHED_LENGTH_CAPPED: 达 max_tokens
+  RUNNING --> FINISHED_ABORTED: 客户端取消
+  FINISHED_STOPPED --> [*]
+  FINISHED_LENGTH_CAPPED --> [*]
+  FINISHED_ABORTED --> [*]
+    </div>
+    <p>状态枚举：<a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/request.py#L370" target="_blank">request.py:370 RequestStatus</a>；入队：<a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L2707" target="_blank">scheduler.py:2707 add_request</a>。</p>
+  </section>
+
+  <section id="preempt">
+    <h2><span class="k">◆</span>4. 抢占与 KV 分配（重点）</h2>
+    <div class="key">
+      <b>核心机制：</b><code>allocate_slots()</code> 若拿不到足够空闲 block 会返回 <code>None</code>，调度器随即<b>驱逐一个 running 请求</b>（抢占），把它降回 waiting 并释放其 KV block。这是 vLLM 在显存受限下保证持续吞吐的关键。
+    </div>
+    <div class="grid">
+      <div class="card">
+        <h3>分配</h3>
+        <p>空闲 block 由 <code>BlockPool</code> 的 <code>free_block_queue</code> 提供，分配即从空闲队列取出并增加引用计数。</p>
+        <p><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/kv_cache_manager.py#L371" target="_blank">kv_cache_manager.py:371 allocate_slots</a></p>
+        <p><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/block_pool.py#L666" target="_blank">block_pool.py:666 get_new_blocks</a></p>
+      </div>
+      <div class="card">
+        <h3>抢占</h3>
+        <p>调度 running 队列时分配失败 → 选牺牲者 → <code>_preempt_request</code>：释放 block、重置 <code>num_computed_tokens=0</code>、放回 waiting 队首。</p>
+        <p><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L833" target="_blank">scheduler.py:833</a> → <a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L1651" target="_blank">scheduler.py:1651</a></p>
+      </div>
+    </div>
+    <div class="mermaid">
+flowchart LR
+  A["schedule: running 请求"] --> B["allocate_slots()"]
+  B -->|成功| C["scheduled_running_reqs"]
+  B -->|None| D["_preempt_request(牺牲者)"]
+  D --> E["释放 block + 状态 PREEMPTED"]
+  E --> F["放回 waiting 队首"]
+  F --> A
+    </div>
+  </section>
+
+  <section id="tiers">
+    <h2><span class="k">◆</span>5. 数据传输：L1 / L2 / L3（重点）</h2>
+    <div class="note warn">
+      <b>命名澄清：</b>代码里没有字面 <code>L1/L2/L3</code>。本页约定 <b>L1=GPU HBM paged KV</b>、<b>L2=CPU DRAM</b>、<b>L3=外部存储（UCM Store）</b>。UCM 侧用「HBM hit vs external hit」表述；vLLM 原生分层卸载侧用 <code>Medium{CPU,STORAGE}</code> + <code>SecondaryTierManager</code> 表述。二者是同一套分层思想的两种实现。
+    </div>
+    <div class="mermaid">
+flowchart LR
+  L1["L1 GPU HBM<br/>paged KV cache"] <-->|GPU 到 CPU DMA 拷贝| L2["L2 CPU DRAM<br/>pinned / shared region"]
+  L2 <-->|UCM load_data / dump_data| L3["L3 外部存储<br/>UCM Store"]
+    </div>
+    <table>
+      <tr><th>层级</th><th>介质</th><th>存放内容</th><th>迁入/迁出</th><th>关键锚点</th></tr>
+      <tr>
+        <td><b>L1</b></td><td>GPU HBM</td><td>当前 batch 的 paged KV cache</td><td>模型读/写</td>
+        <td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/block_pool.py#L666" target="_blank">block_pool.py:666</a></td>
+      </tr>
+      <tr>
+        <td><b>L2</b></td><td>CPU DRAM</td><td>热 KV 暂存 / 加载中转（pinned）</td><td>L1↔L2 DMA 拷贝</td>
+        <td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/kv_offload/cpu/gpu_worker.py#L563" target="_blank">cpu/gpu_worker.py:563 transfer_async</a></td>
+      </tr>
+      <tr>
+        <td><b>L3</b></td><td>外部存储（本地盘/NFS/对象/共享缓存）</td><td>可跨请求/跨实例复用的 prefix KV</td><td>UCM <code>load_data</code>/<code>dump_data</code></td>
+        <td><span class="src local">ucm/store/pipeline/connector.py:153/168</span></td>
+      </tr>
+    </table>
+    <h3>传输粒度与方式</h3>
+    <table>
+      <tr><th>环节</th><th>粒度</th><th>传输方式</th></tr>
+      <tr><td>L1↔L2</td><td>block（HBM 物理块）</td><td>pinned-memory DMA，可选 Triton 小拷贝内核</td></tr>
+      <tr><td>L2↔L3</td><td>block hash（MD5 16B key）+ 设备指针</td><td>UCM Store 的 <code>load_data</code>/<code>dump_data</code>（Posix/NFS/缓存流水线）</td></tr>
+      <tr><td>同步</td><td>CUDA/NPU event</td><td>dump 前用 event 让 copy stream 等待 compute stream 写完 KV</td></tr>
+    </table>
+    <div class="note">
+      <b>另一条 L3 路线（vLLM 原生分层卸载）：</b>仓库另有 <code>vllm/v1/kv_offload/tiering/</code>：L2 由 <code>CPUPrimaryTierOffloadingManager</code> 承担，L3 由 <code>SecondaryTierManager</code> 的 fs / obj / p2p(NIXL) / kvcr 四种后端实现，<code>TieringOffloadingManager.lookup()</code> 逐层查询并触发 promotion（L3→L2）。<span class="src local">vllm/v1/kv_offload/tiering/manager.py:583 / base.py:135</span>
+    </div>
+  </section>
+
+  <section id="ucm">
+    <h2><span class="k">◆</span>6. L3 = UCM 传输详解</h2>
+    <p>UCM 以 vLLM V1 的 <code>KVConnectorBase_V1</code> 协议接入：<b>Scheduler 侧负责 hash + 查外部命中</b>，<b>Worker 侧负责真正的 KV 搬运</b>。入口类 <span class="src local">ucm_connector.py:3396 UCMConnector</span> 是一个分派壳，按配置选 Direct / LayerWise / CP / FAWA / HLA / Blend / Lite。</p>
+
+    <h3>6.1 加载路径（L3 → L1，命中已有 prefix）</h3>
+    <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant S as Scheduler
+  participant UC as UCM 调度侧
+  participant ST as UCM Store
+  participant W as Worker
+  participant UD as UCM 执行侧
+  S->>UC: get_num_new_matched_tokens
+  UC->>UC: RequestHasher 生成 block hash
+  UC->>ST: lookup_on_prefix
+  ST-->>UC: 命中 block 数
+  UC-->>S: external_hit_tokens
+  S->>UC: update_state_after_alloc
+  S->>UC: build_connector_meta
+  UC-->>W: metadata 下发 load_block_ids
+  W->>UD: start_load_kv
+  UD->>ST: load_data keys ptrs
+  ST-->>UD: 完成
+  UD-->>W: KV 就绪 进入 forward
+    </div>
+    <p>锚点：sched 侧 <span class="src local">ucm_connector.py:1973 get_num_new_matched_tokens</span>、<span class="src local">:2046 lookup_on_prefix</span>、<span class="src local">:2243 build_connector_meta</span>；worker 侧 <span class="src local">:2328 start_load_kv</span>；store 侧 <span class="src local">rank_consistency.py:153 submit_load</span> → <span class="src local">store/pipeline/connector.py:153 load_data</span>。</p>
+
+    <h3>6.2 落盘路径（L1 → L3，缓存新算出的 KV）</h3>
+    <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant W as Worker
+  participant UD as UCM 执行侧
+  participant ST as UCM Store
+  participant S as Scheduler
+  W->>UD: wait_for_save
+  UD->>UD: 采集 block ptrs 与 dump event handle
+  UD->>ST: dump_data keys ptrs event
+  ST-->>UD: 异步完成
+  UD-->>S: get_finished 报告落盘
+    </div>
+    <p>锚点：<span class="src local">ucm_connector.py:2529 wait_for_save</span>、<span class="src local">:2985 save_kv_layer(layerwise)</span>、<span class="src local">rank_consistency.py:211 submit_dump</span> → <span class="src local">store/pipeline/connector.py:168 dump_data</span>；完成回收 <span class="src local">:2722 get_finished</span>。</p>
+
+    <h3>6.3 关键机制</h3>
+    <div class="grid">
+      <div class="card">
+        <h3>block hash = 缓存键</h3>
+        <p>链式 <code>parent = MD5(parent, token_block, extra_keys)</code>，命名空间包含模型/TP/dtype/rank 等，key 为 16 字节。</p>
+        <p><span class="src local">ucm_connector.py:85 build_kv_hash_meta</span> · <span class="src local">request_hasher.py:115/135</span></p>
+      </div>
+      <div class="card">
+        <h3>粒度</h3>
+        <p>Direct：整请求 flatten 一次；LayerWise：每层一个 shard（<code>shard_index=layer_id</code>），与 forward 流水重叠。</p>
+        <p><span class="src local">ucm_connector.py:437 / :2890 / :2985</span></p>
+      </div>
+      <div class="card">
+        <h3>异步加载</h3>
+        <p>命中外部 KV 时返回 <code>load_async=True</code>，请求暂挂 <code>WAITING_FOR_REMOTE_KVS</code>，由 <code>get_finished</code> 唤醒。</p>
+        <p><span class="src local">ucm_connector.py:2135 / :2722</span></p>
+      </div>
+      <div class="card">
+        <h3>Store 后端</h3>
+        <p>流水线组合：<code>Cache|Posix</code>、<code>Cache|Compress|Posix</code>、<code>Mooncake</code>、<code>NfsStore</code>、<code>Dram</code> 等，由 <code>store_pipeline</code> 选择。</p>
+        <p><span class="src local">store/pipeline/connector.py:393-409</span></p>
+      </div>
+    </div>
+  </section>
+
+  <section id="e2e">
+    <h2><span class="k">◆</span>7. 端到端案例：命中 L3 的请求</h2>
+    <p>假设请求的 prompt 前段此前已被别的请求写入 L3（UCM），本请求可跳过这部分的计算。</p>
+    <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant U as 用户请求
+  participant S as Scheduler
+  participant KV as KVCacheManager
+  participant UC as UCM
+  participant W as Worker
+  U->>S: add_request
+  S->>KV: 本地 prefix cache 命中 = 0
+  S->>UC: get_num_new_matched_tokens()
+  UC-->>S: 命中 3 个 block（L3）
+  S->>KV: allocate_slots(含命中 block)
+  S->>UC: build_connector_meta(load 这些 block)
+  S->>W: SchedulerOutput
+  W->>UC: start_load_kv() L3→L1
+  W->>W: forward 仅计算未命中部分
+  W->>UC: wait_for_save() 新 KV 落盘 L3
+  W-->>S: ModelRunnerOutput
+  S-->>U: Stream 输出 token
+    </div>
+    <div class="key">
+      <b>收益：</b>L3 命中把「重算 prefill」变成「读 KV」，用外部存储换计算。代价是加载延迟——因此用 <code>persist_token_threshold</code> / <code>load_blocks_threshold</code> 过滤小请求/小命中。
+    </div>
+  </section>
+
+  <section id="index">
+    <h2><span class="k">◆</span>8. 溯源索引</h2>
+    <h3>vLLM（可点开 GitHub，commit 固定）</h3>
+    <table>
+      <tr><th>主题</th><th>锚点</th></tr>
+      <tr><td>请求入口</td><td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/engine/async_llm.py#L397" target="_blank">async_llm.py:397</a></td></tr>
+      <tr><td>引擎主循环</td><td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/engine/core.py#L1589" target="_blank">core.py:1589</a> <a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/engine/core.py#L640" target="_blank">:640</a></td></tr>
+      <tr><td>调度</td><td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L621" target="_blank">scheduler.py:621</a> <a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L2110" target="_blank">:2110</a></td></tr>
+      <tr><td>KV 分配</td><td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/kv_cache_manager.py#L371" target="_blank">kv_cache_manager.py:371</a></td></tr>
+      <tr><td>抢占</td><td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L1651" target="_blank">scheduler.py:1651</a></td></tr>
+      <tr><td>执行</td><td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/worker/gpu_model_runner.py#L3935" target="_blank">gpu_model_runner.py:3935</a></td></tr>
+      <tr><td>Native L2/L3 分层卸载</td><td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/kv_offload/tiering/manager.py#L583" target="_blank">tiering/manager.py:583</a> <a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/kv_offload/tiering/base.py#L135" target="_blank">tiering/base.py:135</a></td></tr>
+      <tr><td>L1→L2 拷贝</td><td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/kv_offload/cpu/gpu_worker.py#L563" target="_blank">cpu/gpu_worker.py:563</a></td></tr>
+    </table>
+    <h3>UCM（本地仓 <code>C:\github项目\lc-unified\unified-cache-management</code>，未推送到可用远程 commit，故用本地 path:line）</h3>
+    <table>
+      <tr><th>主题</th><th>锚点</th></tr>
+      <tr><td>Connector 入口/分派</td><td><span class="src local">ucm/integration/vllm/ucm_connector.py:3396</span> → <span class="src local">:3466-3576</span></td></tr>
+      <tr><td>Sched 命中</td><td><span class="src local">ucm_connector.py:1973 / :2046</span></td></tr>
+      <tr><td>metadata</td><td><span class="src local">ucm_connector.py:2243 / :2187</span></td></tr>
+      <tr><td>Load</td><td><span class="src local">ucm_connector.py:2328</span> → <span class="src local">rank_consistency.py:153</span> → <span class="src local">store/pipeline/connector.py:153</span></td></tr>
+      <tr><td>Dump</td><td><span class="src local">ucm_connector.py:2529</span> → <span class="src local">rank_consistency.py:211</span> → <span class="src local">store/pipeline/connector.py:168</span></td></tr>
+      <tr><td>hash</td><td><span class="src local">ucm_connector.py:85</span> · <span class="src local">request_hasher.py:115</span></td></tr>
+      <tr><td>Store 接口</td><td><span class="src local">ucm/store/ucmstore_v1.py:41</span></td></tr>
+    </table>
+    <div class="note">
+      链接有效性说明：vLLM 链接指向固定 commit <code>e4a676cdc2</code>，可长期复现；UCM 当前 HEAD 未推送到远程可用分支，因此展示本地路径，需在本机 <code>C:\github项目\lc-unified\unified-cache-management</code> 内按行号定位。
+    </div>
+  </section>
+</main>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "base",
+    themeVariables: {
+      fontFamily: '"Segoe UI","Microsoft YaHei",Arial,sans-serif',
+      primaryColor: "#eff6ff",
+      primaryBorderColor: "#1d4ed8",
+      primaryTextColor: "#172033",
+      lineColor: "#64748b",
+      secondaryColor: "#ecfdf5",
+      tertiaryColor: "#f5f3ff",
+      noteBkgColor: "#fffbeb",
+      noteBorderColor: "#f59e0b"
+    },
+    flowchart: { curve: "basis", htmlLabels: true },
+    sequence: { useMaxWidth: true, wrap: true },
+    securityLevel: "loose"
+  });
+</script>
+</body>
+</html>
