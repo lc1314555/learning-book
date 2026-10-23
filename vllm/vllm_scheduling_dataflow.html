@@ -66,11 +66,12 @@
     <a href="#overview">1 总览</a>
     <a href="#schedule">2 调度主流程</a>
     <a href="#state">3 请求状态机</a>
-    <a href="#preempt">4 抢占与 KV 分配</a>
-    <a href="#tiers">5 数据传输 L1/L2/L3</a>
-    <a href="#ucm">6 L3 = UCM 传输详解</a>
-    <a href="#e2e">7 端到端案例</a>
-    <a href="#index">8 溯源索引</a>
+    <a href="#loadasync">4 load_async 调度顺序</a>
+    <a href="#preempt">5 抢占与 KV 分配</a>
+    <a href="#tiers">6 数据传输 L1/L2/L3</a>
+    <a href="#ucm">7 L3 = UCM 传输详解</a>
+    <a href="#e2e">8 端到端案例</a>
+    <a href="#index">9 溯源索引</a>
   </section>
 
   <section id="overview">
@@ -188,8 +189,63 @@ stateDiagram-v2
     <p>状态枚举：<a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/request.py#L370" target="_blank">request.py:370 RequestStatus</a>；入队：<a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L2707" target="_blank">scheduler.py:2707 add_request</a>。</p>
   </section>
 
+  <section id="loadasync">
+    <h2><span class="k">◆</span>4. load_async 调度顺序图（WAITING_FOR_REMOTE_KVS）</h2>
+    <p>当连接器把外部命中标为异步（<code>get_num_new_matched_tokens</code> 返回 <code>load_async=True</code>）时，请求<b>当步就分配 block 作为加载落点，但本步不 forward</b>；传输在步与步之间进行，完成后再重新调度并补分配“计算用”的 block。</p>
+    <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant EC as EngineCore loop
+  participant S as Scheduler
+  participant KV as KVCacheManager
+  participant C as Connector UCM
+  participant W as Worker
+
+  Note over S: 第 N 步 准入
+  EC->>S: schedule
+  S->>C: get_num_new_matched_tokens
+  C-->>S: ext_tokens 且 load_async=True
+  Note over S: 本请求 num_new_tokens 置 0
+  S->>KV: allocate_slots 只为 ext tokens
+  Note over KV: delay_cache_blocks=True 暂不计入 prefix cache
+  KV-->>S: blocks 作为外部 KV 的落点
+  S->>C: update_state_after_alloc 第一次
+  Note over S: 置 WAITING_FOR_REMOTE_KVS 本步不 forward
+  S-->>EC: SchedulerOutput 携带 load 计划
+  EC->>W: execute_model
+  W->>C: start_load_kv 提交异步 Task
+
+  Note over W,C: 步与步之间 异步传输进行中
+  Note over EC,W: 后续若干步该请求仍为 WAITING_FOR_REMOTE_KVS
+
+  Note over S: 第 N+k 步 传输完成后续跑
+  W-->>C: get_finished 上报完成
+  C-->>S: 该请求 KV 就绪
+  EC->>S: schedule
+  S->>KV: allocate_slots 第二次 为新计算 token
+  S->>C: update_state_after_alloc 第二次
+  Note over S: 置 RUNNING 加入 running 队列
+  S-->>EC: SchedulerOutput
+  EC->>W: execute_model 开始 forward
+    </div>
+    <div class="key">
+      <b>两次分配：</b>第一次只为「外部命中要加载的 token」分配（<code>delay_cache_blocks=True</code>，先不计入 prefix cache，避免加载完成前被别的请求读到脏数据）；第二次在加载完成、请求恢复调度时，为「真正要计算的 token」分配。
+    </div>
+    <h3>源码锚点</h3>
+    <table>
+      <tr><th>环节</th><th>锚点</th></tr>
+      <tr><td>查询外部命中</td><td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L1034" target="_blank">scheduler.py:1034</a></td></tr>
+      <tr><td>在途预留检查</td><td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L1298" target="_blank">scheduler.py:1298</a></td></tr>
+      <tr><td>第一次分配 slots</td><td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L1313" target="_blank">scheduler.py:1313</a></td></tr>
+      <tr><td>第一次登记</td><td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L1346" target="_blank">scheduler.py:1346</a></td></tr>
+      <tr><td>置 WAITING_FOR_REMOTE_KVS</td><td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/v1/core/sched/scheduler.py#L1386" target="_blank">scheduler.py:1386</a></td></tr>
+      <tr><td>第二次调用说明</td><td><a class="src" href="https://github.com/lc1314555/vllm/blob/e4a676cdc22f99e808093a87ff8509a6089d392d/vllm/distributed/kv_transfer/kv_connector/v1/base.py#L569" target="_blank">base.py:569 update_state_after_alloc</a></td></tr>
+      <tr><td>UCM 异步返回</td><td><span class="src local">ucm_connector.py:2135 load_async=True</span> <span class="src local">:2722 get_finished 唤醒</span></td></tr>
+    </table>
+  </section>
+
   <section id="preempt">
-    <h2><span class="k">◆</span>4. 抢占与 KV 分配（重点）</h2>
+    <h2><span class="k">◆</span>5. 抢占与 KV 分配（重点）</h2>
     <div class="key">
       <b>核心机制：</b><code>allocate_slots()</code> 若拿不到足够空闲 block 会返回 <code>None</code>，调度器随即<b>驱逐一个 running 请求</b>（抢占），把它降回 waiting 并释放其 KV block。这是 vLLM 在显存受限下保证持续吞吐的关键。
     </div>
@@ -218,7 +274,7 @@ flowchart LR
   </section>
 
   <section id="tiers">
-    <h2><span class="k">◆</span>5. 数据传输：L1 / L2 / L3（重点）</h2>
+    <h2><span class="k">◆</span>6. 数据传输：L1 / L2 / L3（重点）</h2>
     <div class="note warn">
       <b>命名澄清：</b>代码里没有字面 <code>L1/L2/L3</code>。本页约定 <b>L1=GPU HBM paged KV</b>、<b>L2=CPU DRAM</b>、<b>L3=外部存储（UCM Store）</b>。UCM 侧用「HBM hit vs external hit」表述；vLLM 原生分层卸载侧用 <code>Medium{CPU,STORAGE}</code> + <code>SecondaryTierManager</code> 表述。二者是同一套分层思想的两种实现。
     </div>
@@ -255,7 +311,7 @@ flowchart LR
   </section>
 
   <section id="ucm">
-    <h2><span class="k">◆</span>6. L3 = UCM 传输详解</h2>
+    <h2><span class="k">◆</span>7. L3 = UCM 传输详解</h2>
     <p>UCM 以 vLLM V1 的 <code>KVConnectorBase_V1</code> 协议接入：<b>Scheduler 侧负责 hash + 查外部命中</b>，<b>Worker 侧负责真正的 KV 搬运</b>。入口类 <span class="src local">ucm_connector.py:3396 UCMConnector</span> 是一个分派壳，按配置选 Direct / LayerWise / CP / FAWA / HLA / Blend / Lite。</p>
 
     <h3>6.1 加载路径（L3 → L1，命中已有 prefix）</h3>
@@ -324,7 +380,7 @@ sequenceDiagram
   </section>
 
   <section id="e2e">
-    <h2><span class="k">◆</span>7. 端到端案例：命中 L3 的请求</h2>
+    <h2><span class="k">◆</span>8. 端到端案例：命中 L3 的请求</h2>
     <p>假设请求的 prompt 前段此前已被别的请求写入 L3（UCM），本请求可跳过这部分的计算。</p>
     <div class="mermaid">
 sequenceDiagram
@@ -353,7 +409,7 @@ sequenceDiagram
   </section>
 
   <section id="index">
-    <h2><span class="k">◆</span>8. 溯源索引</h2>
+    <h2><span class="k">◆</span>9. 溯源索引</h2>
     <h3>vLLM（可点开 GitHub，commit 固定）</h3>
     <table>
       <tr><th>主题</th><th>锚点</th></tr>
