@@ -83,15 +83,15 @@
 ## 4. 使用方式
 
 `inspect` 检查配置和结构，不写存储；`roundtrip` 进一步检查实际缓存注册和存取。
+默认模式为 `inspect`，建议显式指定 `--mode` 便于区分；提供存储目录不会自动切换模式。
 
 ```bash
 # 配置、结构检查
 ucm-toolkit run sglang-model-check --model /models/model --mode inspect
 
-# Host 存储验证：页大小省略时按缓存类型和平台选择
+# Host 存储验证：其余参数采用默认值或自动选择
 ucm-toolkit run sglang-model-check --model /models/model \
-  --mode roundtrip --pages 5 --max-host-mib 2048 \
-  --storage-backends /mnt/ucm-test --output result.json
+  --mode roundtrip --storage-backends /mnt/ucm-test
 
 # DeepSeek V4 / 昇腾示例
 ucm-toolkit run sglang-model-check --model /models/deepseek-v4 \
@@ -102,6 +102,11 @@ ucm-toolkit run sglang-model-check --model /models/deepseek-v4 \
 ### 配置参数
 
 以下为当前检测命令的参数，默认值以参数定义为准。
+常用只需配置 `--model`、`--mode`，roundtrip 再提供 `--storage-backends`。
+平台、模型/缓存 dtype 和主页面大小默认自动选择；布局默认 `page_first`，
+测试页数为 2，Host 缓冲预算为 512 MiB。默认页数不保证覆盖所有稀疏边界，
+需要时使用 `--pages 5` 等高级选项。验证特定服务时应与其非默认配置保持一致。
+`--help` 仅展示常用参数，`--help-all` 展示全部高级选项；参数功能均保留。
 
 | 参数 | 默认值 | 用途与限制 |
 | --- | --- | --- |
@@ -125,7 +130,8 @@ ucm-toolkit run sglang-model-check --model /models/deepseek-v4 \
 | --connector-module-path | 无 | 自定义 connector 模块路径 |
 | --output | 无 | 同时将 JSON 结果写入指定文件 |
 | --verbose | 关闭 | 输出详细检测信息和异常堆栈 |
-| -h / --help | — | 显示命令帮助 |
+| -h / --help | — | 显示常用参数帮助 |
+| --help-all | — | 显示全部参数，包括高级和模型专用选项 |
 
 模型 dtype 和缓存 dtype 分别配置；后端、量化参数及相关 SGLang 环境变量应与计划部署一致。
 当前没有 TP/PP 数量或超时配置参数，检测仍以单 rank 为范围；超时属于后续执行管理需求。
