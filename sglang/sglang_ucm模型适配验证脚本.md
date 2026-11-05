@@ -49,7 +49,7 @@
 ```
 
 1. **读取配置**：识别模型与缓存类型；可选 meta 模型构造。meta 不支持时，明确记录结构未验证。
-2. **确定格式**：普通池复用配置推导；复杂池在 CPU 上创建小容量 SGLang 原生缓存对象，获取实际布局和池清单。
+2. **确定格式**：优先复用当前 SGLang 的生产建池方法，在 CPU 上创建小容量原生池；混合层规划和测试窗口仍按配置生成。
 3. **注册缓存**：使用真实 Host Pool，调用 `UnifiedCacheStore` 的生产注册接口，检查布局和页面组件。
 4. **验证存取**：填入已知测试数据，写入 Posix，查询命中边界，读到独立位置，逐组件比较字节内容。
 
@@ -116,7 +116,9 @@ ucm-toolkit run sglang-model-check --model /models/deepseek-v4 \
 | --skip-meta-model | 关闭 | 跳过 meta 构造；报告注明模型结构未验证 |
 | --trust-remote-code / --no-trust-remote-code | 开启 | 是否允许加载模型自定义代码 |
 | --platform | auto | auto、cuda、rocm、ascend、xpu、cpu |
-| --device-id | 0 | 设置子进程可见设备，不代表验证多卡 |
+| --device-id | 单 rank 为 0；多 rank 自动选择 | 多 rank 默认使用继承的可见设备列表前 TP×PP 张，未设置时使用 0..TP×PP-1；可显式传逗号分隔的设备列表 |
+| --tp-size / --pp-size | 1 / 1 | 单机 MHA/MLA 及常规 SWA/Mamba 混合池的 TP/PP 检测；大于 1 时自动通过 torchrun 启动，要求 roundtrip 且不跳过 meta 构造 |
+| --distributed-timeout | 300 | 多 rank worker 和通信超时，单位秒 |
 | --layout | page_first | UCM 接受 page_first、page_first_direct |
 | --page-size | 自动选择 | 主缓存页大小；显式指定时必须大于 0 |
 | --pages | 2 | 测试页数，必须大于 0；建议 5 页覆盖多个状态边界 |
@@ -134,7 +136,17 @@ ucm-toolkit run sglang-model-check --model /models/deepseek-v4 \
 | --help-all | — | 显示全部参数，包括高级和模型专用选项 |
 
 模型 dtype 和缓存 dtype 分别配置；后端、量化参数及相关 SGLang 环境变量应与计划部署一致。
-当前没有 TP/PP 数量或超时配置参数，检测仍以单 rank 为范围；超时属于后续执行管理需求。
+默认仍为单 rank。Linux 上 MHA/MLA 及常规 SWA/Mamba 混合模型可增加 `--tp-size 2 --pp-size 2`，
+验证真实 NCCL/HCCL 通信、meta 模型的阶段层范围、各 rank 缓存池及 UCM 回环。
+MLA 按 SGLang writer 规则写入，但所有 rank 读回；测试内存预算按每个 worker 计算。
+混合池按 PP 阶段过滤层，按 TP 上下文获得本地形状，逐池遵循 writer 规则并读回比较。
+MLA 主 KV 与 Mamba 状态可能有不同的复制/分片语义；旧版缺少必要 writer API 时返回无法判定。
+原生 DSA/indexer、DSA＋Mamba、DeepSeek V4 和已支持的 MiniMax sparse 布局也复用原生池构造器，
+按真实 PP 范围和 TP 上下文建池。保留全模型压缩配置，由 SGLang 发现本阶段实际物理区域；
+原生 API 缺失、捕获了其他阶段的数据或不支持的共享布局时返回无法判定。
+DeepSeek V4 按 SGLang 的复制型 MLA 规则处理 writer/key，不按其 MHA 标签推断分片。
+本阶段固定关闭 DP/CP/DCP，MLA SWA 仍需专用描述；不执行真实 forward 或设备缓存拷贝。
+真实设备测试通过前，不应仅凭离线单元测试宣布目标环境支持。
 
 ## 5. 验证边界与结果
 
@@ -157,4 +169,60 @@ ucm-toolkit run sglang-model-check --model /models/deepseek-v4 \
 2. 覆盖完整命中、缺页、稀疏状态边界和逻辑主池场景。
 3. 源与目标位置独立，所有必需组件读回后逐字节一致。
 4. 不支持的布局、组件格式及版本给出明确原因，不把“未验证”当成“不兼容”。
-5. 通过结论限定在实际执行的检查范围，不扩展为推理可用性或多卡适配证明。
+5. 通过结论限定在实际执行的结构、通信和存储范围，不扩展为真实多卡推理可用性证明。
+
+## 7. 文件职责
+
+核心实现位于 `toolkit/ucm_toolkit/tools/sglang_model_check/`。
+
+| 文件 | 主要职责 |
+| --- | --- |
+| `adapter.py` | 命令行入口：解析和校验参数，设置子进程环境；单 rank 启动 runner，多 rank 通过 torchrun 启动 distributed |
+| `config.py` | 统一保存模型、模式、页面、内存预算、TP/PP 等配置，并传递给检测子进程 |
+| `runner.py` | 单 rank 主流程：读取配置、meta 构造、创建和注册 Host 池，执行 UCM 写入、查询、读回和数据比较 |
+| `compatibility.py` | 将模型特征转换为池和 v1/v2 接口需求，检查 UCM 接口与布局；接口存在不等于适配验证通过 |
+| `pool_probe.py` | 规划普通混合池的层划分、几何和尾窗/checkpoint；计算测试持久化位置与预期可恢复前缀，作为查询结果的对照 |
+| `native_probe.py` | 构造 DSA、DeepSeek V4、MiniMax sparse 等原生 CPU 池，复用真实 buffer 描述和 Host builder，管理内存预算与资源释放 |
+| `distributed.py` | 初始化真实 TP/PP 通信组，验证通信、阶段层划分、各 rank 存储读写和查询边界 MIN 共识，汇总结果 |
+| `result.py` | 定义报告状态、错误码和验证范围，生成默认精简输出或 verbose 详细输出 |
+| `sglang_compat/inspector.py` | 集中兼容 SGLang 版本差异，提取模型/混合结构信息，提供离线构造所需的运行时配置上下文 |
+| `__init__.py`、`sglang_compat/__init__.py` | 导出工具类和兼容辅助函数，不承担检测流程 |
+
+职责划分：`pool_probe.py` 负责“需要哪些池、预期结果是什么”，`native_probe.py`
+负责“利用 SGLang 原生实现构造专用池”，`runner.py` / `distributed.py` 负责执行验证。
+
+DSA（含 DSA＋Mamba 的注意力子池）优先复用 SGLang 的 `prepare_host_pool_config`
+与 `build_host_pool_group`，由原生声明完成校验、依赖排序和层映射；检测器仅提供
+小容量 CPU 主 Host 池并关闭 indexer pinning。旧版使用各声明的 builder，verbose
+报告中的 `native_provider.host_pool_assembly` 标明实际路径。
+普通 SWA/Mamba 和 DeepSeek V4 保留现有规划/区域装配路径，不模拟完整 HiCache 控制器。
+
+普通 MHA/MLA（含配置描述的 SWA 子池）、MiniMax sparse 和 DeepSeek V4 也复用
+`KVCacheConfigurator` 的生产建池方法，由框架选择平台、格式和底层参数。
+Mamba 使用原生 `MambaPool` 创建状态，再将真实状态 buffer 交给 Host 池，兼容新旧 Host 接口；
+不再手工创建 temporal/conv 张量。小容量建池上下文由检测器共享提供，不运行完整配置器。
+SWA/Mamba 层规划、测试 checkpoint 和 V4 Host 区域装配仍保留必要描述，不视为完整服务装配证明。
+
+DSA 的设备缓存构造复用当前安装版本的 `KVCacheConfigurator` 方法：普通 Ascend DSA
+走原生 NPU MLA 建池路径；DSA＋Mamba 在各平台均走原生混合池路径，再取出真实注意力子池。
+检测器不再手写 `index_size` 等底层构造参数，也不通过丢弃未知参数掩盖接口变化。
+仅提供小容量、CPU 位置和必要上下文，不执行完整 `configure()`、请求分配或 forward/transfer。
+verbose 的 `native_provider.device_pool_builder` 记录实际使用的方法。
+此复用消除已知的检测器参数/路径不匹配，但不承诺任意未来版本均可离线验证；
+未实际验证的接口和运行时依赖仍应如实返回无法判定，不能改报为模型不兼容。
+
+### 测试、接入与文档
+
+| 文件 | 主要职责 |
+| --- | --- |
+| `toolkit/tests/test_sglang_model_check_toolkit.py` | 验证参数、工具入口、配置、能力判断和报告输出 |
+| `toolkit/tests/test_sglang_model_check_pools.py` | 验证混合池规划、尾窗/checkpoint、联合查询和数据回环；包含可选真实环境集成测试 |
+| `toolkit/tests/test_sglang_model_check_native.py` | 验证原生池构造与装配编排、版本兼容、内存预算和层映射；不执行真实设备 kernel |
+| `toolkit/tests/test_sglang_model_check_distributed.py` | 验证 TP/PP 启动、rank 映射、分区和错误传播；包含可选真实多卡集成测试 |
+| `toolkit/ucm_toolkit/registry.py` | 将检测器注册为 `ucm-toolkit run sglang-model-check` 命令 |
+| 检测器目录下的 `README.md` | 使用方法、参数、覆盖范围、限制与测试方式 |
+| 本文档 `requirements_analysis_zh.md` | 需求目标、实现方案、文件职责和验收边界 |
+| `toolkit/README.md` | 在 toolkit 总说明中提供检测工具简介 |
+
+单元测试与真实环境集成测试的结论必须区分。文件中涉及的结构、通信和 Host/UCM
+存储检查，均不替代权重加载、推理 kernel、设备缓存传输及完整服务启动验证。
