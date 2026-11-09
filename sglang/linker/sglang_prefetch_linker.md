@@ -1,6 +1,6 @@
-# SGLang Prefetch 接入 UCM Linker 需求说明
+﻿# SGLang Prefetch 接入 UCM Linker 需求说明
 
-## 1. 文档范围与状态
+## 1. 背景与目标
 
 本文描述在 `UcmDirectLinker` 中接入 SGLang Unified Cache 外部 linker prefetch 的需求与实现方案。
 
@@ -11,7 +11,7 @@
 
 本文以以上本地源码为基线；旧版 SGLang 的 UCM patch 不应默认具备相同接口。
 
-## 2. 背景
+### 1.1 背景与现状
 
 UCM 已通过 `ucm/integration/sglang/ucm_direct_linker.py` 对接 SGLang 的 Unified Cache，支持从外部存储直接恢复 device KV，避免强制经过 SGLang Host cache。
 
@@ -21,18 +21,16 @@ SGLang 当前源码另外提供了请求排队阶段的 prefetch 框架：在请
 
 补充说明：当前 SGLang factory 会从顶层配置解析 `load_mode`，并在构造动态 linker 后设置实例属性。因而设置 `load_mode=prefetch` 可以切换 wrapper 分支，但 UCM 继承的默认 `prefetch()` 返回 `None`，不会产生有效预取。配置开关本身不足以完成接入。
 
-## 3. 目的与边界
+### 1.2 目标
 
-### 3.1 目的
-
-1. 利用请求排队时间提前恢复外部 KV，减少请求 admission 后等待存储 I/O 的时间。
+1. 利用请求排队时间提前恢复外部 KV，减少请求进入执行批次后等待存储 I/O 的时间。
 2. 复用 SGLang 已有的命中判断、显存管理、多 rank 协调、发布和回退流程。
 3. 复用 UCM adapter 的地址准备、异步提交、任务检查和等待能力。
 4. 保持原有 `layer_wise` 为默认模式，允许按部署场景选择。
 
 预取收益依赖队列等待时间、命中长度、存储带宽和显存容量，不保证所有负载下优于按层加载。
 
-### 3.2 首期边界
+### 1.3 范围与限制
 
 - 支持当前 SGLang external linker prefetch 框架，要求 PP=1。
 - 组件支持沿用 UCM 当前可恢复的 pool/layout 范围；Full、窗口状态、Mamba 的具体组合须分别验证。
@@ -40,9 +38,9 @@ SGLang 当前源码另外提供了请求排队阶段的 prefetch 框架：在请
 - 不实现异步 lookup、预测未来请求、跨请求 I/O 合并或运行中 I/O 强制终止。
 - 旧版本 patch 的移植作为独立兼容工作，不承诺仅更新 UCM 即可支持。
 
-## 4. Prefetch 机制介绍
+## 2. 核心概念
 
-### 4.1 两类预取
+### 2.1 预取类型
 
 | 类型 | 数据流 | 与本需求关系 |
 | --- | --- | --- |
@@ -51,7 +49,102 @@ SGLang 当前源码另外提供了请求排队阶段的 prefetch 框架：在请
 
 UCM 现有 worker 连续提交后续层的操作属于按层加载内部的 I/O 流水，不等同于请求排队阶段的 prefetch。旧配置 `sglang_load_prefetch_layers` 在当前 adapter 中仅作兼容并被移除，不应作为本功能开关。
 
-### 4.2 请求级预取流程
+### 2.2 队列与执行批次
+
+这三个概念属于不同层次。“执行队列”在本文中更准确地称为执行批次，不应理解为必然存在一个独立的 FIFO 队列。
+
+| 概念 | 保存内容 | 处理方 | 作用 |
+| --- | --- | --- | --- |
+| 请求等待队列 | 尚未被选入执行批次的推理请求 | SGLang 调度器 | 等待显存、token 预算等调度资源 |
+| 执行批次 | 本轮选中执行 prefill 或 decode 的请求集合 | 模型执行器与 GPU | 组织本轮模型计算 |
+| load 任务队列 | 将外部 KV 恢复到指定 GPU slots 的任务 | UCM 后台 load 线程 | 组织缓存数据读取，不执行模型推理 |
+
+请求本身不会从请求队列“移动到 load 队列”；进入 load 队列的是为它生成的加载任务。启用 prefetch 时，同一个请求可以仍在等待调度，而它的加载任务已经在 load 线程中执行。
+
+## 3. 两种加载模式与流程对比
+
+两图均以从上到下表示时间推进，使用相同的参与方。T0～T4 表示各模式内的事件顺序，不代表两图对应事件发生在相同的绝对时间；间隔不按比例绘制。预取图展示加载在批次接纳前成功完成的情况，不表示预取一定更快。
+
+### 3.1 未启用 prefetch：按层加载
+
+```mermaid
+sequenceDiagram
+    participant S as 调度器 / 请求状态
+    participant L as UCM load 队列与线程
+    participant G as GPU 模型计算
+    Note over S,G: T0 请求入队
+    rect rgb(245, 245, 245)
+        Note over S: 等待显存、token 预算等资源
+        Note over L: 尚未为该请求启动 KV 读取
+        Note over G: 可以继续执行其他请求
+    end
+    Note over S,G: T1 调度器将请求纳入执行批次
+    S->>S: 查询外部命中，init_load_back
+    S->>L: load() 登记任务，暂不启动 I/O
+    S->>S: 完成批次构建
+    S->>L: start_layer_wise_loading() 提交任务
+    Note over S,G: T2 worker 开始实际 I/O
+    L->>L: 准备地址并提交各层读取
+    L-->>G: 第 0 层 KV 就绪
+    Note over S,G: T3 开始该请求的模型计算
+    par 计算与后续层 I/O 重叠
+        G->>G: 执行第 0 层计算
+    and
+        L->>L: 继续加载后续层
+    end
+    L-->>G: 后续层 KV 就绪
+    G->>G: 逐层等待并计算
+    Note over S,G: T4 全部加载完成，按既有路径确认结果
+```
+
+查询命中、登记任务和实际提交 I/O 是三个不同的时点。排队期间可能进行命中查询，但实际读取在批次构建后启动加载、准备执行该批次时发生；第一层数据就绪即可计算，无需等全部层恢复。
+
+恢复尾部先属于请求私有空间，加载未确认时不能作为共享树命中。加载失败沿用现有执行路径处理。
+
+### 3.2 启用 prefetch：排队期间加载
+
+```mermaid
+sequenceDiagram
+    participant S as 调度器 / 请求状态
+    participant L as UCM load 队列与线程
+    participant G as GPU 模型计算
+    Note over S,G: T0 请求入队
+    S->>S: 查询外部命中，协商恢复边界
+    S->>S: 预留 GPU slots，锁住 anchor
+    S->>L: prefetch() 提交全层任务，返回 Future
+    rect rgb(235, 245, 255)
+        Note over S: 请求仍在等待调度
+        Note over L: T1 worker 开始实际 I/O
+        par 利用请求排队时间加载
+            L->>L: 提交并等待全部层、全部 pool 的读取
+        and
+            G->>G: 可以继续执行其他请求
+        end
+        L-->>S: T2 全部写入结束，Future 成功
+        S->>S: 事件轮询确认所有 rank 成功
+        S->>S: 发布 KV 到 radix tree
+    end
+    Note over S,G: T3 调度器将请求纳入执行批次
+    S->>S: 匹配已发布的 GPU KV
+    S->>G: 提交模型计算
+    Note over S,G: T4 开始计算剩余 token
+    G->>G: 使用已恢复 KV 执行模型
+```
+
+请求继续留在等待队列，load 线程执行的是为其生成的加载任务。若调度器尝试接纳请求时加载尚未完成，则按第 3.4 节策略决定是否继续等待；失败或放弃的结果不会发布，运行中写入结束后才能释放 slots。
+
+| 对比项 | 按层模式 | 预取模式 |
+| --- | --- | --- |
+| I/O 发起阶段 | 进入执行批次/批次构建阶段 | 请求入队阶段 |
+| 重叠对象 | 各层 forward | 请求排队及其他工作 |
+| 首层计算 | 第一层所需数据就绪后可开始 | 预取发布要求全部层完成 |
+| 共享缓存可见性 | 走请求既有插入与完成确认流程 | 全部 rank 成功后由 wrapper 提前发布 |
+| 显存占用 | 主要是进入批次的恢复请求 | 额外包含排队预取和已放弃但仍在写入的 slots |
+| 主要代价 | 执行阶段可能等待 I/O | 提前占用显存，可能发生无效预取 |
+
+预取模式不是无条件更快；队列很短或显存紧张时，按层模式可能更合适。
+
+### 3.3 预取的内部处理
 
 1. 请求入队后，SGLang `_prefetch_kvcache()` 调用 linker wrapper 的 `prefetch(req)`。
 2. 匹配现有 GPU 前缀，对未缓存部分按 page 对齐，并基于前缀 hash 生成存储 key。
@@ -61,28 +154,28 @@ UCM 现有 worker 连续提交后续层的操作属于按层加载内部的 I/O 
 6. 调用 UCM `prefetch(transfers)`，获得表示整体加载结果的 Future。
 7. 后台执行所有层和 pool 的加载；事件轮询确认各 rank 均成功且停止写入。
 8. SGLang wrapper 发布到 radix tree，处理重复前缀与组件绑定，释放 anchor 锁。
-9. 请求 admission 时重新匹配已发布 GPU KV，未恢复部分正常计算。
+9. 请求进入执行批次时重新匹配已发布 GPU KV，未恢复部分正常计算。
 
 当前 lookup 是同步调用，可能阻塞调度线程；本需求的异步范围主要是数据传输阶段。
 
-### 4.3 等待与失败策略
+### 3.4 等待、超时与失败
 
 | 策略 | 行为 |
 | --- | --- |
-| `best_effort` | admission 时消费已完成结果，否则停止等待并回退计算 |
+| `best_effort` | 进入执行批次时消费已完成结果，否则停止等待并回退计算 |
 | `wait_complete` | 保持等待，直至任务完成并被事件轮询处理 |
-| `timeout` | 从首次阻塞 admission 的轮询开始计时，超时停止等待 |
+| `timeout` | 从首次因预取未完成而阻塞批次接纳的轮询开始计时，超时停止等待 |
 
 当前框架超时预算由 `prefetch_timeout_base` 和按 token/page 折算的附加项构成，预算构造使用待查询 hash 数量，不能默认等同于最终命中长度。默认基数为 1 秒，每 1024 tokens 附加 0.25 秒。
 
 停止等待后，排队任务可取消；运行中的任务必须保留私有 slots，直到所有 rank 都停止写入，再释放并丢弃结果。失败或放弃的预取不得发布，后续请求通过正常计算恢复。
 
-## 5. 功能与正确性需求
+## 4. 功能与正确性需求
 
 | 编号 | 需求 |
 | --- | --- |
 | F1 | 默认保持 `layer_wise`，支持顶层 `load_mode=prefetch` |
-| F2 | 实现 `prefetch(transfers) -> Future[bool] \u007c None`，提交后立即返回 |
+| F2 | 实现 `prefetch(transfers) -> Future[bool] 或 None`，提交后立即返回 |
 | F3 | 无法接收任务时返回 `None`，由 wrapper 统一回收预留资源 |
 | F4 | Future 成功必须代表全部层、全部参与 pool 完整恢复，且所有 device 写入停止 |
 | F5 | 任何提交或等待失败均须 drain 已提交任务，再结束 Future |
@@ -93,9 +186,9 @@ UCM 现有 worker 连续提交后续层的操作属于按层加载内部的 I/O 
 
 不变量：Future 进入终态之后不得继续向对应 slots 写入；不完整数据不得入树；任一 rank 失败不得仅在其他 rank 发布；取消不能改变各 rank 的 collective 参与顺序。
 
-## 6. 实现方案
+## 5. 实现方案
 
-### 6.1 职责划分
+### 5.1 职责划分
 
 | 模块 | 职责 |
 | --- | --- |
@@ -106,7 +199,7 @@ UCM 现有 worker 连续提交后续层的操作属于按层加载内部的 I/O 
 
 UCM 不自行向 radix tree 发布结果，也不重复实现 wrapper 的 timeout、显存回收或多 rank collective。
 
-### 6.2 UCM linker 改造
+### 5.2 UCM linker 改造
 
 增加明确的预取任务类型，至少包含 transfers、依赖事件和 `Future[bool]`；与现有按层批次任务共用加载队列和 worker。使用明确类型或任务标签区分两条路径，避免依赖含义不清的 tuple 位置。
 
@@ -119,7 +212,27 @@ UCM 不自行向 radix tree 发布结果，也不重复实现 wrapper 的 timeou
 
 worker 处理预取任务前调用 `set_running_or_notify_cancel()`；已在排队阶段取消的任务不再触碰 device slots。运行中的任务执行完成或失败 drain 后，设置整体结果。
 
-### 6.3 提取公共加载逻辑
+#### 一个 prefetch 任务与所有层的关系
+
+本方案中，一次成功接受的 `prefetch(transfers)` 调用生成一个 load 队列任务和一个整体 Future，负责本次命中范围内所有层、所有参与 pool 的恢复。“全部层”指命中 token 对应的各模型层 KV，不是加载该请求所有 token，也不是预先计算尚不存在的 KV。
+
+```text
+一个请求的本次外部命中
+  → 一个 prefetch 队列任务
+      → 准备各 pool 的地址与传输布局
+      → 提交第 0 层 I/O 子任务
+      → 提交第 1 层 I/O 子任务
+      → ……
+      → 检查并等待全部子任务结束
+  → Future 完成
+  → SGLang 确认所有 rank 成功后发布到缓存树
+```
+
+一个队列任务可以拆成多个底层 I/O 子任务，且可连续异步提交，不要求一次 I/O 读取所有层。单个 load 线程负责队列任务的处理，也不等于底层每次只能执行一个 I/O。
+
+按本方案的单 worker 实现，当前任务未处理完时，后续任务可能仍在 load 队列等待；多个请求都提交了 Future，并不保证它们的整请求加载会并行执行。跨请求 I/O 合并与并发调度不属于首期要求。现有按层模式还可能将多个请求的恢复合并为一个批次任务，与预取模式的一次调用一个任务不同。
+
+### 5.3 提取公共加载逻辑
 
 将 `_load_worker()` 中准备地址、逐层提交、检查完成和 drain 的代码提取为公共函数，允许传入层完成回调：
 
@@ -139,7 +252,7 @@ worker 处理预取任务前调用 `set_running_or_notify_cancel()`；已在排�
 
 应确认 adapter 的 `wait()` 成功代表数据完整落入 device；若底层存在短读或部分成功，必须转化为失败，不能只根据任务提交成功判定完成。
 
-### 6.4 配置与生命周期
+### 5.4 配置与生命周期
 
 当前 SGLang dynamic factory 在构造 linker 后才设置 `load_mode`。因此 UCM worker 应在构造时同时具备两类任务的处理能力，不应依赖构造期间读取最终模式来选择唯一 worker。
 
@@ -147,54 +260,9 @@ worker 处理预取任务前调用 `set_running_or_notify_cancel()`；已在排�
 
 首期建议先使用框架默认 timeout 参数。显式设置 timeout 参数前，应处理当前 dynamic 配置严格字段校验与顶层 timeout 字段之间的兼容问题：通用解析层需消费 timeout 字段，或将其定义为允许的通用字段，不能直接将未识别字段交给 `UnifiedCacheLinkerConfig.from_dict()`。
 
-关闭与 reset 必须覆盖新增 Future 任务；队列取消、异常路径和 worker 退出都不得留下永久 pending Future。预取占用量由 wrapper 计入 GPU 容量，UCM 不重复计数。
+将新增 Future 任务纳入现有 reset/close 管理，覆盖队列取消、异常和 worker 退出路径。预取占用量由 wrapper 计入 GPU 容量，UCM 不重复计数。
 
-## 7. 接入前后流程区别
-
-### 7.1 接入前：按层加载
-
-```text
-请求入队
-  → 等待调度
-  → 匹配 GPU 前缀并查询外部命中
-  → init_load_back / load 暂存恢复任务
-  → 组建执行批次
-  → start_layer_wise_loading
-  → 第 0 层加载完成 → 第 0 层计算
-  → 后续层加载与计算重叠
-  → 确认加载结果，按既有请求插入流程进入树
-```
-
-外部恢复尾部先属于请求私有空间，不在加载未确认时作为共享树命中。加载失败由现有执行路径处理，不能套用预取的失败回退语义。
-
-### 7.2 接入后：预取模式
-
-```text
-请求入队
-  → 查询外部命中并协商共同恢复边界
-  → 分配私有 GPU slots，锁住 anchor
-  → UCM 异步加载全部层（与排队时间重叠）
-  → 事件轮询确认所有 rank 完成
-  → 成功：发布 radix tree
-  → admission：匹配已经完整可用的 GPU KV
-  → 计算剩余 token
-
-未完成：按 best_effort / wait_complete / timeout 决定是否等待
-失败或停止等待：不发布，运行中写入结束后释放 slots，回退计算
-```
-
-| 对比项 | 按层模式 | 预取模式 |
-| --- | --- | --- |
-| I/O 发起阶段 | admission/批次构建阶段 | 请求入队阶段 |
-| 重叠对象 | 各层 forward | 请求排队及其他工作 |
-| 首层计算 | 第一层所需数据就绪后可开始 | 预取发布要求全部层完成 |
-| 共享缓存可见性 | 走请求既有插入与完成确认流程 | 全部 rank 成功后由 wrapper 提前发布 |
-| 显存占用 | 主要是进入批次的恢复请求 | 额外包含排队预取和已放弃但仍在写入的 slots |
-| 主要代价 | 执行阶段可能等待 I/O | 提前占用显存，可能发生无效预取 |
-
-预取模式不是无条件更快；队列很短或显存紧张时，按层模式可能更合适。
-
-## 8. 使用方法（实现完成后的目标用法）
+## 6. 使用方法（实现完成后的目标用法）
 
 以下示例展示 Linux 推理环境的启动形式，需完成本需求后使用，并沿用现有有效的模型、设备及 UCM 配置。当前代码仅设置此配置不会获得有效预取。
 
@@ -224,12 +292,12 @@ python -m sglang.launch_server \
 
 验证缓存复用时，先发起请求并确认 offload 完成，再通过另一实例或清理 GPU 本地缓存后的请求触发外部恢复；保持模型、token、cache salt 和存储命名一致，避免只测到本地 GPU 命中。不要通过清空外部存储的方式验证外部命中。
 
-## 9. 验收与验证
+## 7. 验收与验证
 
-### 9.1 正确性验收
+### 7.1 正确性验收
 
 1. 默认模式与改造前行为一致。
-2. 预取确实在 admission 前提交，全层成功后才可匹配到树中结果。
+2. 预取确实在进入执行批次前提交，全层成功后才可匹配到树中结果。
 3. 与禁用外部缓存的结果对照，验证输出与 KV 恢复正确性。
 4. 覆盖 miss、部分命中、稀疏恢复边界以及 Full/窗口/Mamba 支持组合。
 5. 多 rank 中任一 rank 失败或超时，所有 rank 对发布/丢弃保持一致。
@@ -239,13 +307,13 @@ python -m sglang.launch_server \
 
 测试分为可控假 adapter 的任务生命周期测试，以及真实 GPU/UCM backend 的集成测试。假 adapter 不能替代 device 写入顺序与完整性验证。
 
-### 9.2 性能与可观测性
+### 7.2 性能与可观测性
 
 在相同模型、命中长度、存储状态和请求并发下，对比两种模式的 TTFT、吞吐、排队时间、GPU 峰值占用、加载耗时和无效读取量。至少区分短队列、长队列、低命中和显存压力场景。
 
 建议日志包含预取提交/完成/失败/取消数、读取页数、排队及执行耗时；区分“停止等待”和“I/O 已停止”。首期不设未经测量的固定性能提升指标。
 
-## 10. 主要源码参考
+## 8. 主要源码参考
 
 - `ucm/integration/sglang/ucm_direct_linker.py`：lookup、按层任务队列、worker、reset/close。
 - `ucm/integration/sglang/ucm_direct_store_adapter.py`：UCM 配置、prepare/submit/check/wait 与 stream prerequisite。
@@ -255,3 +323,4 @@ python -m sglang.launch_server \
 - `python/sglang/srt/mem_cache/unified_radix_cache.py`：预取入口、进度检查、事件处理及 timeout 初始化。
 - `python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_direct_linker.py`：已有 Future 预取实现参考。
 - `ucm/integration/sglang/patch/v0520/`：旧版适配参考，需单独审计接口兼容性。
+
