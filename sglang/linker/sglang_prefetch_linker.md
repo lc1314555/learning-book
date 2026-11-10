@@ -1,4 +1,4 @@
-﻿# SGLang Prefetch 接入 UCM Linker 需求说明
+# SGLang Prefetch 接入 UCM Linker 需求说明
 
 ## 1. 背景与目标
 
@@ -269,7 +269,6 @@ worker 处理预取任务前调用 `set_running_or_notify_cancel()`；已在排�
 ```bash
 python -m sglang.launch_server \
   --model-path /path/to/model \
-  --enable-unified-cache \
   --enable-unified-cache-external-linker \
   --unified-cache-external-linker-backend dynamic \
   --unified-cache-external-linker-config '{
