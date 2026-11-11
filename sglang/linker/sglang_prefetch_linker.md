@@ -70,6 +70,7 @@ UCM 现有 worker 连续提交后续层的操作属于按层加载内部的 I/O 
 ```mermaid
 sequenceDiagram
     participant S as 调度器 / 请求状态
+    participant E as 外部存储（经 UCM adapter）
     participant L as UCM load 队列与线程
     participant G as GPU 模型计算
     Note over S,G: T0 请求入队
@@ -78,26 +79,34 @@ sequenceDiagram
         Note over L: 尚未为该请求启动 KV 读取
         Note over G: 可以继续执行其他请求
     end
-    Note over S,G: T1 调度器将请求纳入执行批次
-    S->>S: 查询外部命中，init_load_back
+    Note over S: 调度检查：尝试匹配前缀，此时尚未保证进入批次
+    S->>S: match_prefix → wrapper.match，匹配 GPU 前缀
+    S->>E: 同步 UCM lookup() 查询未缓存部分
+    E-->>S: 返回可恢复前缀边界集合（不传输 KV）
+    Note over S: 调度重试可能再次触发匹配与 lookup
+    Note over S,G: T1 确定恢复范围，调度器尝试将请求纳入批次
+    S->>S: init_load_back
     S->>L: load() 登记任务，暂不启动 I/O
     S->>S: 完成批次构建
     S->>L: start_layer_wise_loading() 提交任务
     Note over S,G: T2 worker 开始实际 I/O
-    L->>L: 准备地址并提交各层读取
+    L->>L: 准备地址
+    L->>E: 提交各层 KV 读取（实际数据 I/O）
+    E-->>L: 各层数据写入预留 GPU slots
     L-->>G: 第 0 层 KV 就绪
     Note over S,G: T3 开始该请求的模型计算
     par 计算与后续层 I/O 重叠
         G->>G: 执行第 0 层计算
     and
-        L->>L: 继续加载后续层
+        L->>E: 继续提交或等待后续层读取
+        E-->>L: 后续层数据写入 GPU slots
     end
     L-->>G: 后续层 KV 就绪
     G->>G: 逐层等待并计算
     Note over S,G: T4 全部加载完成，按既有路径确认结果
 ```
 
-查询命中、登记任务和实际提交 I/O 是三个不同的时点。排队期间可能进行命中查询，但实际读取在批次构建后启动加载、准备执行该批次时发生；第一层数据就绪即可计算，无需等全部层恢复。
+两种模式的 lookup 都在调度侧同步执行，不进入 load 任务队列；GPU 已完整命中时无需查询外存。图中的查询表示 linker 访问存储适配层，不承诺每次都产生远端网络请求。查询命中、登记任务和实际提交 I/O 是三个不同的时点。排队期间可能进行命中查询，但实际读取在批次构建后启动加载、准备执行该批次时发生；第一层数据就绪即可计算，无需等全部层恢复。
 
 恢复尾部先属于请求私有空间，加载未确认时不能作为共享树命中。加载失败沿用现有执行路径处理。
 
@@ -106,17 +115,24 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant S as 调度器 / 请求状态
+    participant E as 外部存储（经 UCM adapter）
     participant L as UCM load 队列与线程
     participant G as GPU 模型计算
     Note over S,G: T0 请求入队
-    S->>S: 查询外部命中，协商恢复边界
+    S->>S: _prefetch_kvcache → wrapper.prefetch(req)
+    S->>S: 匹配 GPU 前缀
+    S->>E: 同步 UCM lookup() 查询未缓存部分
+    E-->>S: 返回可恢复前缀边界集合（不传输 KV）
+    S->>S: 各 rank 协商共同恢复边界
     S->>S: 预留 GPU slots，锁住 anchor
     S->>L: prefetch() 提交全层任务，返回 Future
     rect rgb(235, 245, 255)
         Note over S: 请求仍在等待调度
         Note over L: T1 worker 开始实际 I/O
         par 利用请求排队时间加载
-            L->>L: 提交并等待全部层、全部 pool 的读取
+            L->>E: 提交全部层、全部 pool 的 KV 读取
+            E-->>L: 数据写入预留 GPU slots
+            L->>L: 等待全部 I/O 结束
         and
             G->>G: 可以继续执行其他请求
         end
@@ -125,7 +141,7 @@ sequenceDiagram
         S->>S: 发布 KV 到 radix tree
     end
     Note over S,G: T3 调度器将请求纳入执行批次
-    S->>S: 匹配已发布的 GPU KV
+    S->>S: 匹配已发布的 GPU KV（普通 match 不查外存）
     S->>G: 提交模型计算
     Note over S,G: T4 开始计算剩余 token
     G->>G: 使用已恢复 KV 执行模型
@@ -135,7 +151,8 @@ sequenceDiagram
 
 | 对比项 | 按层模式 | 预取模式 |
 | --- | --- | --- |
-| I/O 发起阶段 | 进入执行批次/批次构建阶段 | 请求入队阶段 |
+| lookup 时机 | 调度前缀匹配时，可能因重试多次触发 | 请求入队后的预取入口 |
+| KV 数据 I/O 发起阶段 | 进入执行批次/批次构建阶段 | 请求入队阶段 |
 | 重叠对象 | 各层 forward | 请求排队及其他工作 |
 | 首层计算 | 第一层所需数据就绪后可开始 | 预取发布要求全部层完成 |
 | 共享缓存可见性 | 走请求既有插入与完成确认流程 | 全部 rank 成功后由 wrapper 提前发布 |
