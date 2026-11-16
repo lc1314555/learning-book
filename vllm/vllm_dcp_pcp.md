@@ -1,5 +1,14 @@
 # vLLM PCP / DCP 特性与 UCM 适配分析
 
+## PCP、DCP 是什么？
+
+大模型推理通常分两步：**Prefill（预填充）**一次处理输入提示词，并生成历史 token 的 KV Cache（注意力计算需要复用的 Key/Value 张量）；**Decode（解码）**利用历史 KV，逐步生成后续 token。Context Parallel（上下文并行）沿 token/序列维度，让多张卡分担计算或缓存。
+
+- **PCP（Prefill Context Parallel，预填充上下文并行）**：把长提示词的 prefill 计算分给多张卡。例如输入有 32K token，PCP=4 时，各卡处理分配给自己的 query 片段，再通过通信完成必要同步。主要目标是缩短首 token 等待时间；实际可以采用首尾配对，并非简单连续四等分。
+- **DCP（Decode Context Parallel，解码上下文并行）**：把历史 KV 按序列位置分散保存在多张卡上。生成新 token 时，各卡读取本地 KV、计算局部 attention，再合并结果。主要目标是减少每卡历史 KV 的存储和读取压力；它也影响带历史缓存的 prefill。
+
+可以概括为：**PCP 主要分担输入阶段的计算，DCP 主要分担历史 KV 的存储与访问。** 当前实现中，PCP 增加计算进程，DCP 复用已有 TP/PCP 进程；叠加时不能直接相乘来计算 KV 分片数。
+
 ## 1. 范围与结论
 
 本文基于 2026-11-16 的本地工作区静态检查，未进行多卡运行验证。“当前拓扑”指本地代码，不表示已核对远端最新版本。
