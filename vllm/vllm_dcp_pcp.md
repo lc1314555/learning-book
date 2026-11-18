@@ -213,3 +213,266 @@ PCP 数量变化但实际 KV 布局不变时，可以共享缓存。DCP、TP、i
 | UCM | `ucm/integration/vllm/ucm_connector.py:3445` | 元数据切片 |
 | UCM | `ucm/integration/vllm/ucm_connector.py:3848` | Connector 选择 |
 | UCM | `ucm/integration/vllm/hma_connector.py:1193` | Ascend V4.1 限制 |
+
+## 9. 图解：模型数据分布与 UCM 修改前后的区别
+
+本节补充于 2026-11-18，描述工作区中两轮改造后的逻辑。前文“现存问题”和“PP 尚不支持”等表述描述修改前基线；应结合本节理解当前代码状态。13项 CPU 回归测试已通过，但 PP+PCP+DCP 的 NPU 执行、量化/MTP组合和 UCM 外部热加载精度尚未实机验证。
+
+### 9.1 先分清四种数据和四个维度
+
+```text
+模型权重：训练好的矩阵，推理时加载，不是请求的KV缓存
+激活数据：本次计算产生的中间结果，跨PP stage传递
+attention KV：请求历史token的缓存，DCP主要分片的对象
+辅助缓存：SFA indexer、scale、压缩或窗口状态，可能有独立布局
+
+PP  → 沿模型层切分，每个stage只负责部分层
+TP  → 在stage内部切分权重/heads，部分张量仍复制
+PCP → 增加计算rank，拆prefill query；可对特定权重进一步分片
+DCP → 复用已有rank，沿历史序列分片attention KV
+```
+
+DP=1 时：总卡数=PP×TP×PCP。DCP 不额外增加卡数，也不是全部权重的额外切分倍数。
+
+### 9.2 二维网格：行是 TP 组，列是 PCP 组
+
+下面使用 TP2、PCP2、PP1，共4卡。编号仅为示意；实际 DCP rank 必须读取通信组，不能从全局编号猜测。
+
+```text
+                         TP方向
+                     TP0        TP1
+PCP坐标0              卡0        卡1     ← TP组A
+PCP坐标1              卡2        卡3     ← TP组B
+                      ↕          ↕
+                   PCP组0      PCP组1
+
+TP组：  [卡0,卡1]、[卡2,卡3]
+PCP组： [卡0,卡2]、[卡1,卡3]
+```
+
+“PCP坐标0的一行”不叫一个 PCP 组。此前口语中的“每组 PCP 一套模型”，准确说是：不同 PCP 坐标上的 TP 组，会复制普通 TP 权重分片；支持 PCP 权重分片的模块除外。
+
+普通 TP 权重 W 的放置：
+
+```text
+卡0：W的TP分片0          卡1：W的TP分片1
+卡2：W的TP分片0（副本）  卡3：W的TP分片1（副本）
+```
+
+若某模块启用 TP×PCP 权重分片，则四卡持有四个更小分片。当前 Ascend 的 Embedding/LM Head，以及满足条件的 SFA/DSA O-projection 可以采用这类路径；量化方法和实际开关可能使其回退。MoE 专家权重还受 EP 支配，不能仅凭这张 TP 图推算 GLM 的全部权重。DCP 本身不把 W 再切一遍。
+
+### 9.3 MHA/GQA：head 分区与 token 分区是两回事
+
+下面假设 KV heads 足够，TP2 分为 H0、H1；实际 head 数少于并行度时可能引入 KV head 复制。图表示一种清晰的 head 分片实例，不是所有 GQA 配置。
+
+PCP2、DCP1：计算query不同，但每个TP head分区的完整历史在PCP间复制。
+
+```text
+                  TP0                   TP1
+PCP0        H0 × 全序列KV          H1 × 全序列KV
+PCP1        H0 × 全序列KV          H1 × 全序列KV
+              ↑同列为副本             ↑同列为副本
+```
+
+PCP2、DCP2=PCP：每列内部沿token分片，head分区保持不同。
+
+```text
+                  TP0                   TP1
+PCP0        H0 × token分片S0       H1 × token分片S0
+PCP1        H0 × token分片S1       H1 × token分片S1
+
+每列S0+S1恢复对应heads的完整序列。
+```
+
+S0/S1 是交错布局的示意，不一定为连续前半/后半段。当前 Ascend GQA 堆叠仅支持 DCP=PCP，且专用 GQA DCP 已进入弃用流程；不能将 MLA/SFA 的全网格 DCP 直接用于 GQA。
+
+修改后的 UCM 对非 MLA 使用独立 head namespace：PCP 堆叠且 DCP=PCP 时保留 TP head 身份，而不是错误地做 TP/DCP。注意：`is_mla` 来自引擎配置，模型名字中包含 MoE/DSA 不等于 UCM 一定按非 MLA 分支处理。
+
+### 9.4 MLA：latent KV 通常不按 query heads 切分
+
+MLA 的历史缓存主要是压缩 latent 及相关位置分量，不能照普通 MHA 将其理解为不同 query heads 的独立 KV。
+
+TP2、PCP2 的典型分布：
+
+```text
+DCP1：
+卡0：完整latent KV      卡1：完整latent KV
+卡2：完整latent KV      卡3：完整latent KV
+
+DCP2=PCP：
+卡0：latent序列S0       卡1：latent序列S0
+卡2：latent序列S1       卡3：latent序列S1
+     两列DCP组之间可能保留相同latent分片
+
+DCP4=TP×PCP：
+卡0：S[r0]              卡1：S[r2]
+卡2：S[r1]              卡3：S[r3]
+     四个实际DCP rank共同覆盖完整历史
+```
+
+这里 r0～r3 表示按 PCP 优先逻辑顺序展示的 DCP 位置，实际运行以初始化组顺序为准。当前引擎可能为 collective 顺序调整 rank 排列。
+
+UCM 对 MLA 使用统一 latent namespace，再通过 DCP rank 映射外部块。新的 CP 保存逻辑不再使用“TP副本轮流只保存部分块”的规则：DCP rank 已拥有不同序列内容，不能再丢掉其中部分块。相同副本可能重复写同一键，专用副本去重和leader分发尚未实现。
+
+### 9.5 GLM SFA：大 KV 分片，小 indexer 仍复制
+
+你当前日志的后端为 ASCEND_SFA/ASCEND_SFA_INDEXER，使用 replicated indexer。以 TP2、PCP2、DCP4 为例：
+
+```text
+              attention KV             indexer KV
+卡0          本地序列分片S[r0]          完整序列索引缓存
+卡2          本地序列分片S[r1]          完整序列索引缓存
+卡1          本地序列分片S[r2]          完整序列索引缓存
+卡3          本地序列分片S[r3]          完整序列索引缓存
+
+attention：各卡只读自己的历史分片，再合并结果
+indexer：需要全历史视图，选择一致的稀疏位置
+```
+
+因此，“DCP消除了复制”只能用于相应的attention KV，不能用于整个缓存包。UCM 的 replicated tensor 缩放逻辑会对符合布局条件的 indexer 同时放大拷贝长度和物理步长，使一份逻辑块覆盖应有物理行；scale 等分量也需要随对应布局保存。
+
+GLM 的 MoE 专家权重、attention 权重、indexer 缓存和 attention KV 是不同对象；不能由 replicated indexer 推断所有权重也复制。
+
+DSA/V4.1 的压缩、窗口和循环状态则更复杂：本次组合改造未解除其专用 Connector 的限制，也不能仅恢复长期 KV 就认为完整前缀状态已经恢复。
+
+### 9.6 PP：复制的是计算网格，不是整个模型层集合
+
+以80层、TP2、PCP2、PP2为示意，总计8卡。层数与分配仅为示例，不代表 GLM 实际配置。
+
+```text
+PP stage0：第0～39层                PP stage1：第40～79层
+             TP0    TP1                         TP0    TP1
+PCP0         卡0    卡1             PCP0        卡4    卡5
+PCP1         卡2    卡3             PCP1        卡6    卡7
+             TP×PCP网格                        TP×PCP网格
+                    └────── 中间激活 ──────→┘
+
+stage0只持有前40层权重及这些层的KV
+stage1只持有后40层权重及这些层的KV
+```
+
+DCP 在每个 stage 内建立，不能跨 PP stage 把不同层误认为同一 KV 分片。若每个 stage 的 DCP=4，则两边分别有4个序列分片，并不是一个跨8卡的 DCP8组。
+
+普通 TP 权重仍在同一 stage 的 PCP 坐标之间复制；跨 stage 保存的是不同层。Embedding/LM Head、专家及 PCP 权重分片遵循各模块实现。
+
+### 9.7 修改前后：TP4/PCP2/DCP8/PP2 对照
+
+这个组合共16卡，每个 PP stage 8卡。
+
+```text
+物理拓扑（改造不改变引擎的这张图）：
+
+stage0，负责前半模型层          stage1，负责后半模型层
+PCP0 [0 1 2 3]                 PCP0 [ 8  9 10 11]
+PCP1 [4 5 6 7]                 PCP1 [12 13 14 15]
+内部DCP8                        内部DCP8
+```
+
+修改前：
+
+```text
+PP>1且CP启用 → Connector直接拒绝启动
+
+即使简单删掉拒绝检查，旧CP仍认为：
+序列分片数 = PCP×DCP = 2×8 = 16（实际每stage只有8份）
+逻辑块范围 = B×16（实际为B×8）
+owner编号  = DCP×pcp_rank+dcp_rank（把相关坐标再次叠加）
+非MLA TP折算 = TP/DCP = 4//8 = 0（不合法）
+```
+
+修改后：
+
+```text
+PP stage隔离：stage0 store             stage1 store
+序列分片数：      DCP8                     DCP8
+逻辑块范围：      B×8                      B×8
+本地归属：        实际DCP rank             实际DCP rank
+
+调度器：等待各stage握手
+        → 根据真实层范围/块字节数建立stores
+        → 查询所有stage和必需head分区
+        → 只报告全部完整的连续前缀
+worker：只加载/保存自己stage的层和本地DCP分片
+```
+
+对于 TP4/PCP2/DCP2/PP2，分片数相应为每 stage 2，而非旧式4。非 MLA 的 TP head 分区仍为4；MLA latent 使用统一内容namespace。
+
+### 9.8 一块缓存如何映射到外部对象
+
+示例：B=128、DCP=4、interleave=128，一个引擎虚拟块覆盖512 token。
+
+```text
+全局token范围：       0～511
+                     │
+       ┌─────────────┼──────────────┐
+DCP0：0～127    DCP1：128～255  DCP2：256～383  DCP3：384～511
+       │                 │              │              │
+UCM： K0                K1             K2             K3
+
+worker拿到的本地物理block容量仍为128 token，
+各rank的block ID数值即使相同，也指向各自设备上的不同缓存。
+```
+
+改造后的列表映射：
+
+```text
+调度器keys： [K0 K1 K2 K3 | K4 K5 K6 K7 | ...]
+DCP0读取：   [K0          | K4          | ...]
+DCP1读取：   [   K1       |    K5       | ...]
+DCP2读取：   [      K2    |       K6    | ...]
+DCP3读取：   [         K3 |          K7 | ...]
+```
+
+PCP 不再次增加该列表的每组对象数。对 replicated indexer，一份对应对象还需要包含其完整的相关物理行；上图仅画 attention KV token 分布。对象键是请求语义链生成的标识，不等于简单地对图中局部token片段单独哈希。
+
+PP 加入后，每个 stage 在自己的目录写这些键，内容为不同层：
+
+```text
+共享Posix根目录
+├─ pp_0_l<起始层>-<层数>/  K0、K1、K2、K3……（stage0层数据）
+└─ pp_1_l<起始层>-<层数>/  K0、K1、K2、K3……（stage1层数据）
+```
+
+同名K不表示数据相同，必须结合stage目录和格式身份解释。
+
+### 9.9 修改前后的命中和保存
+
+```text
+缓存查询
+                 stage0: K0 K1 K2 K3 都存在
+请求某前缀 ────→ stage1: K0 K1 缺K2 K3
+                               ↓
+修改后：该虚拟块不能算完整命中；只保留此前完整连续前缀
+```
+
+已有 PP 层本来就提供跨stage最短前缀聚合，本次不是新发明这项能力，而是让CP初始化正确接入它，并在握手前返回未命中；CP还会查询必需的非MLA head namespace。
+
+```text
+保存路径
+修改前的通用MLA规则：TP副本按块位置分担保存
+                     ↓ 套到DCP后可能丢掉独有序列分片
+修改后的CP规则：每个worker保留全部本地DCP块进行保存
+                     ↓ 正确性优先，副本可能重复写
+```
+
+本次仍使用现有任务等待/完成接口，没有新增跨卡广播和分布式事务协议。CPU测试证明映射及控制逻辑，不证明所有worker完成事件在所有后端组合下均正确。
+
+### 9.10 当前可测试范围与尚未完成事项
+
+| 组合 | 当前代码路径 | 验证状态 |
+| --- | --- | --- |
+| TP+纯DCP、PP1 | 原有CP映射基础，保留纯DCP哈希格式 | 用户已报告GLM TP16/DCP16精度正常；最新修改仍需回归 |
+| TP+PCP、DCP1 | PCP副本读取完整对应缓存 | CPU映射测试通过，NPU待测 |
+| TP+PCP+DCP、PP1 | DCP取实际组，不再乘PCP | CPU映射测试通过，NPU待测 |
+| TP+PP、无CP | 既有layerwise PP路径，资源逻辑回归 | 本次CPU测试覆盖部分控制逻辑 |
+| TP+PP+DCP | stage存储隔离+stage内DCP | 引擎允许的模型组合下，NPU待测 |
+| TP+PP+PCP及三者组合 | layerwise模式接入PP握手与CP分片 | CPU组合测试通过，NPU待测 |
+| PP+CP整块模式 | 明确拒绝 | 未实现 |
+| FAWA/V4.1及特殊混合状态 | 保留原有专用限制 | 不因本次修改自动支持 |
+| 跨TP/DCP布局复用、leader加载分发 | 未实现 | 需要另行设计 |
+
+第一版使用共享Posix、use_layerwise=true。组合PCP+DCP要求interleave=block_size；当前Ascend传输场景也要求该设置。PCP使用Model Runner V2。不要删除模型后端自身的合法性校验来强行运行不支持组合。
+
+推荐验证 TP4/PCP2/DCP2/PP2 和 TP4/PCP2/DCP8/PP2，先关闭UCM建立引擎基线，再使用新存储目录冷保存，重启后确认外部命中和实际加载，最后比较精度。PP层数可自动分配，手动分层时必须使用当前模型真实层数。
+
+本节对应代码：`ucm/integration/vllm/ucm_connector.py` 中的 `CPTopology`、`UCMCPConnector`、`UCMLayerWiseConnector._configure_pp_store`、`set_xfer_handshake_metadata_pp_aware`、`_lookup_all_stages`；回归测试为 `test/test_cp_topology.py`。未新增生产拓扑文件。
